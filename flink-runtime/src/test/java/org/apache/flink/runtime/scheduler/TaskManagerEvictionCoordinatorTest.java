@@ -18,6 +18,7 @@
 
 package org.apache.flink.runtime.scheduler;
 
+import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
@@ -47,8 +48,8 @@ import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
 import org.apache.flink.runtime.jobmaster.TestingLogicalSlotBuilder;
+import org.apache.flink.runtime.jobmaster.slotpool.DefaultAllocatedSlotPool;
 import org.apache.flink.runtime.jobmaster.slotpool.DefaultDeclarativeSlotPool;
-import org.apache.flink.runtime.jobmaster.slotpool.DefaultDeclarativeSlotPoolBuilder;
 import org.apache.flink.runtime.messages.checkpoint.AcknowledgeCheckpoint;
 import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 import org.apache.flink.runtime.slots.ResourceRequirement;
@@ -276,11 +277,15 @@ class TaskManagerEvictionCoordinatorTest {
         private final DirectScheduledExecutorService graphExecutor =
                 new DirectScheduledExecutorService();
         private final DefaultDeclarativeSlotPool pool =
-                DefaultDeclarativeSlotPoolBuilder.builder()
-                        .setSlotRequestMaxInterval(Duration.ZERO)
-                        .build();
-        private final SimpleAckingTaskManagerGateway gateway =
-                new SimpleAckingTaskManagerGateway();
+                new DefaultDeclarativeSlotPool(
+                        new JobID(),
+                        new DefaultAllocatedSlotPool(),
+                        ignored -> {},
+                        Duration.ofSeconds(20),
+                        Duration.ofSeconds(20),
+                        Duration.ZERO,
+                        ComponentMainThreadExecutorServiceAdapter.forMainThread());
+        private final SimpleAckingTaskManagerGateway gateway = new SimpleAckingTaskManagerGateway();
         private final DefaultExecutionGraph graph;
         private final ExecutionVertex vertex;
         private final CheckpointCoordinator checkpoints;
