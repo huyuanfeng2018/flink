@@ -77,6 +77,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Deterministic policy tests using real checkpoint, slot-pool and execution-graph components. */
 class TaskManagerEvictionCoordinatorTest {
+    private static final ResourceProfile SLOT_PROFILE =
+            ResourceProfile.newBuilder().setCpuCores(1).build();
+
     @Test
     void repeatedIntentDoesNotRestartTheQuietWindow() throws Exception {
         try (Fixture f = new Fixture()) {
@@ -363,7 +366,7 @@ class TaskManagerEvictionCoordinatorTest {
         }
 
         private AllocationID offer(TaskManagerLocation location) {
-            final SlotOffer offer = new SlotOffer(new AllocationID(), 0, ResourceProfile.UNKNOWN);
+            final SlotOffer offer = new SlotOffer(new AllocationID(), 0, SLOT_PROFILE);
             assertThat(
                             pool.offerSlots(
                                     Collections.singleton(offer),

@@ -50,7 +50,8 @@ jobs:
       - name: Validate runtime and Kubernetes integration
         run: |
           set -euo pipefail
-          ./mvnw -B -T 2 -pl flink-kubernetes -am \
+          # All reactor dependencies, including test JARs, were installed above.
+          ./mvnw -B -T 2 -pl flink-runtime,flink-kubernetes \
             -Dtest='*Eviction*,BlocklistDeclarativeSlotPoolTest,DefaultDeclarativeSlotPoolTest,DeclarativeSlotPoolBridgeTest,DefaultSchedulerTest,AdaptiveSchedulerTest,ExecutingTest,JobMasterTest,FineGrainedSlotManagerTest,ActiveResourceManagerTest,ResourceManagerTest,KubernetesPodTest,KubernetesResourceManagerDriverTest' \
             -Dsurefire.failIfNoSpecifiedTests=false test 2>&1 | tee /tmp/flink-eviction-validation.log
       - name: Publish test reports and diagnostic logs
