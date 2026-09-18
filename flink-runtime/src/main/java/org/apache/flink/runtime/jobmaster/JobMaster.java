@@ -25,6 +25,7 @@ import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
+import org.apache.flink.configuration.TaskManagerEvictionOptions;
 import org.apache.flink.core.execution.CheckpointType;
 import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.core.failure.FailureEnricher;
@@ -45,6 +46,7 @@ import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
+import org.apache.flink.runtime.executiongraph.ExecutionGraph;
 import org.apache.flink.runtime.executiongraph.JobStatusListener;
 import org.apache.flink.runtime.heartbeat.HeartbeatListener;
 import org.apache.flink.runtime.heartbeat.HeartbeatManager;
@@ -57,13 +59,16 @@ import org.apache.flink.runtime.io.network.partition.JobMasterPartitionTracker;
 import org.apache.flink.runtime.io.network.partition.PartitionTrackerFactory;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
+import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobgraph.JobResourceRequirements;
+import org.apache.flink.runtime.jobgraph.JobType;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobmanager.OnCompletionActions;
 import org.apache.flink.runtime.jobmanager.PartitionProducerDisposedException;
 import org.apache.flink.runtime.jobmaster.factories.JobManagerJobMetricGroupFactory;
 import org.apache.flink.runtime.jobmaster.slotpool.BlocklistDeclarativeSlotPoolFactory;
+import org.apache.flink.runtime.jobmaster.slotpool.DeclarativeSlotPool;
 import org.apache.flink.runtime.jobmaster.slotpool.DeclarativeSlotPoolFactory;
 import org.apache.flink.runtime.jobmaster.slotpool.DefaultDeclarativeSlotPoolFactory;
 import org.apache.flink.runtime.jobmaster.slotpool.SlotPoolService;
@@ -89,6 +94,7 @@ import org.apache.flink.runtime.rpc.RpcService;
 import org.apache.flink.runtime.rpc.RpcServiceUtils;
 import org.apache.flink.runtime.scheduler.ExecutionGraphInfo;
 import org.apache.flink.runtime.scheduler.SchedulerNG;
+import org.apache.flink.runtime.scheduler.TaskManagerEvictionCoordinator;
 import org.apache.flink.runtime.shuffle.JobShuffleContext;
 import org.apache.flink.runtime.shuffle.JobShuffleContextImpl;
 import org.apache.flink.runtime.shuffle.PartitionWithMetrics;
@@ -110,6 +116,7 @@ import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.InstantiationUtil;
 import org.apache.flink.util.MdcUtils;
 import org.apache.flink.util.SerializedValue;
+import org.apache.flink.util.clock.SystemClock;
 import org.apache.flink.util.concurrent.FutureUtils;
 
 import org.slf4j.Logger;
@@ -203,6 +210,8 @@ public class JobMaster extends FencedRpcEndpoint<JobMasterId>
     // --------- Scheduler --------
 
     private final SchedulerNG schedulerNG;
+
+    @Nullable private final TaskManagerEvictionCoordinator taskManagerEvictionCoordinator;
 
     private final JobManagerJobStatusListener jobStatusListener;
 
@@ -409,6 +418,55 @@ public class JobMaster extends FencedRpcEndpoint<JobMasterId>
                         executionDeploymentTracker,
                         jobManagerJobMetricGroup,
                         schedulerListener);
+
+        if (jobMasterConfiguration.getConfiguration().get(TaskManagerEvictionOptions.ENABLED)) {
+            checkState(
+                    executionPlan instanceof JobGraph
+                            && executionPlan.getJobType() == JobType.STREAMING,
+                    "Cooperative TaskManager eviction requires a streaming JobGraph.");
+            checkState(
+                    schedulerNG.getSchedulerType() == JobManagerOptions.SchedulerType.Default
+                            || schedulerNG.getSchedulerType()
+                                    == JobManagerOptions.SchedulerType.Adaptive,
+                    "Cooperative TaskManager eviction requires the Default or Adaptive scheduler.");
+            taskManagerEvictionCoordinator =
+                    new TaskManagerEvictionCoordinator(
+                            new TaskManagerEvictionCoordinator.Context() {
+                                @Override
+                                public JobStatus getJobStatus() {
+                                    return schedulerNG.requestJobStatus();
+                                }
+
+                                @Override
+                                public Optional<ExecutionGraph> getExecutionGraph() {
+                                    return schedulerNG.getExecutionGraphForTaskManagerEviction();
+                                }
+
+                                @Override
+                                public boolean restart() {
+                                    return schedulerNG.restartForTaskManagerEviction();
+                                }
+
+                                @Override
+                                public void onFinished() {
+                                    schedulerNG.onTaskManagerEvictionFinished();
+                                }
+                            },
+                            slotPoolService
+                                    .castInto(DeclarativeSlotPool.class)
+                                    .orElseThrow(
+                                            () ->
+                                                    new IllegalStateException(
+                                                            "A declarative slot pool is required for eviction.")),
+                            jobMasterConfiguration.getConfiguration(),
+                            ((JobGraph) executionPlan).getCheckpointingSettings(),
+                            getMainThreadExecutor(),
+                            SystemClock.getInstance(),
+                            jobManagerJobMetricGroup.addGroup("taskManagerEviction"));
+            schedulerNG.setTaskManagerEvictionCoordinator(taskManagerEvictionCoordinator);
+        } else {
+            taskManagerEvictionCoordinator = null;
+        }
 
         this.heartbeatServices = checkNotNull(heartbeatServices);
         this.taskManagerHeartbeatManager = NoOpHeartbeatManager.getInstance();
@@ -1146,6 +1204,28 @@ public class JobMaster extends FencedRpcEndpoint<JobMasterId>
     }
 
     @Override
+    public CompletableFuture<Acknowledge> notifyTaskManagersPendingEviction(
+            ResourceManagerId resourceManagerId,
+            Collection<ResourceID> taskManagers,
+            Duration timeout) {
+        if (establishedResourceManagerConnection == null
+                || !resourceManagerId.equals(
+                        establishedResourceManagerConnection
+                                .getResourceManagerGateway()
+                                .getFencingToken())) {
+            return FutureUtils.completedExceptionally(
+                    new FlinkException(
+                            "Eviction intent is not from the connected ResourceManager."));
+        }
+        if (taskManagerEvictionCoordinator == null) {
+            return FutureUtils.completedExceptionally(
+                    new FlinkException("Cooperative TaskManager eviction is disabled."));
+        }
+        taskManagerEvictionCoordinator.notifyTaskManagersPendingEviction(taskManagers);
+        return CompletableFuture.completedFuture(Acknowledge.get());
+    }
+
+    @Override
     public CompletableFuture<Acknowledge> notifyNewBlockedNodes(Collection<BlockedNode> newNodes) {
         blocklistHandler.addNewBlockedNodes(newNodes);
         return CompletableFuture.completedFuture(Acknowledge.get());
@@ -1275,6 +1355,9 @@ public class JobMaster extends FencedRpcEndpoint<JobMasterId>
     }
 
     private CompletableFuture<Void> stopScheduling() {
+        if (taskManagerEvictionCoordinator != null) {
+            taskManagerEvictionCoordinator.close();
+        }
         jobManagerJobMetricGroup.close();
         jobStatusListener.stop();
 

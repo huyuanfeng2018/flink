@@ -20,8 +20,10 @@ package org.apache.flink.kubernetes;
 
 import org.apache.flink.configuration.BlobServerOptions;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.DeploymentOptions;
 import org.apache.flink.configuration.GlobalConfiguration;
 import org.apache.flink.configuration.JobManagerOptions;
+import org.apache.flink.configuration.TaskManagerEvictionOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
 import org.apache.flink.kubernetes.configuration.KubernetesResourceManagerDriverConfiguration;
@@ -119,6 +121,13 @@ public class KubernetesResourceManagerDriver
 
     @Override
     protected void initializeInternal() throws Exception {
+        final boolean evictionEnabled = flinkConfig.get(TaskManagerEvictionOptions.ENABLED);
+        Preconditions.checkArgument(
+                !evictionEnabled
+                        || "kubernetes-application"
+                                .equals(flinkConfig.get(DeploymentOptions.TARGET)),
+                "Cooperative TaskManager eviction requires Kubernetes application mode.");
+        log.info("Cooperative TaskManager eviction enabled: {}.", evictionEnabled);
         podsWatchOptFuture = watchTaskManagerPods();
         final File podTemplateFile = KubernetesUtils.getTaskManagerPodTemplateFileInPod();
         if (podTemplateFile.exists()) {
@@ -293,6 +302,11 @@ public class KubernetesResourceManagerDriver
                 ++currentMaxAttemptId);
 
         getResourceEventHandler().onPreviousAttemptWorkersRecovered(recoveredWorkers);
+        for (KubernetesPod pod : podList) {
+            if (!pod.isTerminated() && pod.isScheduled()) {
+                notifyPendingEviction(pod);
+            }
+        }
     }
 
     private void updateKubernetesServiceTargetPortIfNecessary() throws Exception {
@@ -365,9 +379,16 @@ public class KubernetesResourceManagerDriver
                                     onPodTerminated(pod);
                                 } else if (pod.isScheduled()) {
                                     onPodScheduled(pod);
+                                    notifyPendingEviction(pod);
                                 }
                             }
                         });
+    }
+
+    private void notifyPendingEviction(KubernetesPod pod) {
+        if (flinkConfig.get(TaskManagerEvictionOptions.ENABLED) && pod.isPendingEviction()) {
+            getResourceEventHandler().onWorkerPendingEviction(new ResourceID(pod.getName()));
+        }
     }
 
     private void onPodScheduled(KubernetesPod pod) {

@@ -161,6 +161,9 @@ class Executing extends StateWithExecutionGraph
     }
 
     private boolean parallelismChanged() {
+        if (context.isTaskManagerEvictionInProgress()) {
+            return false;
+        }
         final VertexParallelism currentParallelism =
                 extractCurrentVertexParallelism(getExecutionGraph());
         return context.getAvailableVertexParallelism()
@@ -287,6 +290,16 @@ class Executing extends StateWithExecutionGraph
                                     }
                                     return null;
                                 }));
+    }
+
+    void restartForTaskManagerEviction() {
+        context.goToRestarting(
+                getExecutionGraph(),
+                getExecutionGraphHandler(),
+                getOperatorCoordinatorHandler(),
+                Duration.ZERO,
+                extractCurrentVertexParallelism(getExecutionGraph()),
+                getFailures());
     }
 
     @Override
@@ -445,6 +458,10 @@ class Executing extends StateWithExecutionGraph
                     StateTransitions.ToFailing,
                     StateTransitions.ToRestarting,
                     StateTransitions.ToStopWithSavepoint {
+
+        default boolean isTaskManagerEvictionInProgress() {
+            return false;
+        }
 
         /**
          * Asks how to handle the failure.

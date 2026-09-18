@@ -47,15 +47,18 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Default {@link DeclarativeSlotPool} implementation.
@@ -101,6 +104,10 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
 
     private ResourceCounter totalResourceRequirements;
 
+    private final Set<ResourceID> pendingEvictionTaskManagers = new HashSet<>();
+    private ResourceCounter evictionRecoveryRequirements = ResourceCounter.empty();
+    private boolean evictionReservationActive;
+
     private ResourceCounter fulfilledResourceRequirements;
 
     private NewSlotsListener newSlotsListener = NoOpNewSlotsListener.INSTANCE;
@@ -136,6 +143,117 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         this.totalResourceRequirements = ResourceCounter.empty();
         this.fulfilledResourceRequirements = ResourceCounter.empty();
         this.slotToRequirementProfileMappings = new HashMap<>();
+    }
+
+    @Override
+    public Set<ResourceID> markTaskManagersForEviction(Collection<ResourceID> taskManagers) {
+        final Set<ResourceID> newlyMarked = new HashSet<>(taskManagers);
+        newlyMarked.removeAll(pendingEvictionTaskManagers);
+        if (newlyMarked.isEmpty()) {
+            return newlyMarked;
+        }
+        pendingEvictionTaskManagers.addAll(newlyMarked);
+        // Never release a running payload just because the platform expressed an intent.
+        final Collection<AllocationID> freeSlots =
+                slotPool.getFreeSlotTracker().getFreeSlotsInformation().stream()
+                        .filter(
+                                slot ->
+                                        newlyMarked.contains(
+                                                slot.getTaskManagerLocation().getResourceID()))
+                        .map(SlotInfo::getAllocationId)
+                        .collect(Collectors.toList());
+        for (AllocationID allocationId : freeSlots) {
+            releaseSlot(allocationId, new FlinkException("TaskManager is pending eviction."));
+        }
+        if (evictionReservationActive) {
+            declareResourceRequirements();
+        }
+        return newlyMarked;
+    }
+
+    @Override
+    public void beginTaskManagerEviction() {
+        evictionRecoveryRequirements = getPinnedResourceRequirements();
+        evictionReservationActive = true;
+        declareResourceRequirements();
+    }
+
+    @Override
+    public void finishTaskManagerEviction() {
+        evictionRecoveryRequirements = ResourceCounter.empty();
+        evictionReservationActive = false;
+        declareResourceRequirements();
+    }
+
+    @Override
+    public boolean isTaskManagerPendingEviction(ResourceID taskManager) {
+        return pendingEvictionTaskManagers.contains(taskManager);
+    }
+
+    @Override
+    public Collection<? extends SlotInfo> getSlotsInformationForScheduling() {
+        return slotPool.getAllSlotsInformation().stream()
+                .filter(
+                        slot ->
+                                !isTaskManagerPendingEviction(
+                                        slot.getTaskManagerLocation().getResourceID()))
+                .collect(Collectors.toList());
+    }
+
+    /** Also overridden by the blocklist implementation; a blocked node is not healthy capacity. */
+    protected boolean isExcludedFromEvictionCapacity(ResourceID taskManager) {
+        return isTaskManagerPendingEviction(taskManager);
+    }
+
+    @Override
+    public boolean hasSufficientResourcesForTaskManagerEviction() {
+        final ResourceCounter required = getPinnedResourceRequirements();
+        ResourceCounter fulfilled = ResourceCounter.empty();
+        for (SlotInfo slot : slotPool.getAllSlotsInformation()) {
+            if (!isExcludedFromEvictionCapacity(slot.getTaskManagerLocation().getResourceID())) {
+                final ResourceCounter matched = fulfilled;
+                final Optional<ResourceProfile> profile =
+                        requirementMatcher.match(
+                                slot.getResourceProfile(), required, matched::getResourceCount);
+                if (profile.isPresent()) {
+                    fulfilled = fulfilled.add(profile.get(), 1);
+                }
+            }
+        }
+        return required.subtract(fulfilled).isEmpty();
+    }
+
+    private ResourceCounter getPinnedResourceRequirements() {
+        ResourceCounter pinned = totalResourceRequirements;
+        for (Map.Entry<ResourceProfile, Integer> entry :
+                evictionRecoveryRequirements.getResourcesWithCount()) {
+            final int missing = entry.getValue() - pinned.getResourceCount(entry.getKey());
+            if (missing > 0) {
+                pinned = pinned.add(entry.getKey(), missing);
+            }
+        }
+        return pinned;
+    }
+
+    private ResourceCounter getEffectiveResourceRequirements() {
+        if (!evictionReservationActive) {
+            return totalResourceRequirements;
+        }
+        ResourceCounter effective = getPinnedResourceRequirements();
+        for (SlotInfo slot : slotPool.getAllSlotsInformation()) {
+            if (isTaskManagerPendingEviction(slot.getTaskManagerLocation().getResourceID())) {
+                // Allocation IDs, not subtasks: slot sharing must not multiply the extra demand.
+                effective = effective.add(getMatchingResourceProfile(slot.getAllocationId()), 1);
+            }
+        }
+        return effective;
+    }
+
+    private Collection<SlotOffer> acceptPreviouslyOfferedSlots(
+            Collection<? extends SlotOffer> offers) {
+        return offers.stream()
+                .filter(offer -> slotPool.containsSlot(offer.getAllocationId()))
+                .collect(Collectors.toList());
     }
 
     @Override
@@ -220,7 +338,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         final Collection<ResourceRequirement> currentResourceRequirements = new ArrayList<>();
 
         for (Map.Entry<ResourceProfile, Integer> resourceRequirement :
-                totalResourceRequirements.getResourcesWithCount()) {
+                getEffectiveResourceRequirements().getResourcesWithCount()) {
             currentResourceRequirements.add(
                     ResourceRequirement.create(
                             resourceRequirement.getKey(), resourceRequirement.getValue()));
@@ -236,6 +354,10 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
             TaskManagerGateway taskManagerGateway,
             long currentTime) {
 
+        if (isTaskManagerPendingEviction(taskManagerLocation.getResourceID())) {
+            // Rejecting duplicate offers would fail an already-running execution.
+            return acceptPreviouslyOfferedSlots(offers);
+        }
         log.debug("Received {} slot offers from TaskExecutor {}.", offers, taskManagerLocation);
 
         return internalOfferSlots(
@@ -292,6 +414,9 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
             TaskManagerLocation taskManagerLocation,
             TaskManagerGateway taskManagerGateway,
             long currentTime) {
+        if (isTaskManagerPendingEviction(taskManagerLocation.getResourceID())) {
+            return acceptPreviouslyOfferedSlots(slots);
+        }
         // This method exists to allow slots to be re-offered by recovered TMs while the job is in a
         // restarting state (where it usually hasn't set any requirements).
         // For this to work with the book-keeping of this class these slots are "matched" against
@@ -357,13 +482,13 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
             ResourceProfile resourceProfile) {
         return requirementMatcher.match(
                 resourceProfile,
-                totalResourceRequirements,
+                getEffectiveResourceRequirements(),
                 fulfilledResourceRequirements::getResourceCount);
     }
 
     @VisibleForTesting
     ResourceCounter calculateUnfulfilledResources() {
-        return totalResourceRequirements.subtract(fulfilledResourceRequirements);
+        return getEffectiveResourceRequirements().subtract(fulfilledResourceRequirements);
     }
 
     private AllocatedSlot createAllocatedSlot(
@@ -393,6 +518,13 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
     @Override
     public PhysicalSlot reserveFreeSlot(
             AllocationID allocationId, ResourceProfile requiredSlotProfile) {
+        slotPool.getSlotInformation(allocationId)
+                .ifPresent(
+                        slot ->
+                                Preconditions.checkState(
+                                        !isTaskManagerPendingEviction(
+                                                slot.getTaskManagerLocation().getResourceID()),
+                                        "Cannot reserve a slot on a TaskManager pending eviction."));
         final AllocatedSlot allocatedSlot = slotPool.reserveFreeSlot(allocationId);
 
         Preconditions.checkState(
@@ -435,6 +567,16 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
     @Override
     public ResourceCounter freeReservedSlot(
             AllocationID allocationId, @Nullable Throwable cause, long currentTime) {
+        if (slotPool.getSlotInformation(allocationId)
+                .map(
+                        slot ->
+                                isTaskManagerPendingEviction(
+                                        slot.getTaskManagerLocation().getResourceID()))
+                .orElse(false)) {
+            return releaseSlot(
+                    allocationId,
+                    new FlinkException("Returning a draining TaskManager slot.", cause));
+        }
         log.debug("Free reserved slot {}.", allocationId);
 
         final Optional<AllocatedSlot> freedSlot =
@@ -556,7 +698,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
                 slotPool.getFreeSlotTracker().getFreeSlotsWithIdleSinceInformation();
 
         ResourceCounter excessResources =
-                fulfilledResourceRequirements.subtract(totalResourceRequirements);
+                fulfilledResourceRequirements.subtract(getEffectiveResourceRequirements());
 
         final Iterator<AllocatedSlotPool.FreeSlotInfo> freeSlotIterator =
                 freeSlotsInformation.iterator();
@@ -595,6 +737,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
     }
 
     private void releaseSlots(Iterable<AllocatedSlot> slotsToReturnToOwner, Throwable cause) {
+        boolean releasedDrainingSlot = false;
         for (AllocatedSlot slotToReturn : slotsToReturnToOwner) {
             Preconditions.checkState(!slotToReturn.isUsed(), "Free slot must not be used.");
 
@@ -604,6 +747,7 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
                 log.info("Releasing slot [{}].", slotToReturn.getAllocationId());
             }
 
+            releasedDrainingSlot |= isTaskManagerPendingEviction(slotToReturn.getTaskManagerId());
             final ResourceProfile matchingResourceProfile =
                     getMatchingResourceProfile(slotToReturn.getAllocationId());
             fulfilledResourceRequirements =
@@ -626,6 +770,9 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
                                     throwable);
                         }
                     });
+        }
+        if (releasedDrainingSlot && evictionReservationActive) {
+            declareResourceRequirements();
         }
     }
 

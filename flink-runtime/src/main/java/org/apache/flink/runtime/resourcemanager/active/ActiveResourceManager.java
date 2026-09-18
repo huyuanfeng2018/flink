@@ -300,7 +300,13 @@ public class ActiveResourceManager<WorkerType extends ResourceIDRetrievable>
     }
 
     @Override
+    public void onWorkerPendingEviction(ResourceID resourceId) {
+        notifyWorkerPendingEviction(resourceId);
+    }
+
+    @Override
     public void onWorkerTerminated(ResourceID resourceId, String diagnostics) {
+        forgetWorkerEviction(resourceId);
         if (currentAttemptUnregisteredWorkers.contains(resourceId)) {
             recordWorkerFailureAndPauseWorkerCreationIfNeeded();
         }
@@ -583,6 +589,7 @@ public class ActiveResourceManager<WorkerType extends ResourceIDRetrievable>
             return false;
         }
 
+        forgetWorkerEviction(resourceId);
         WorkerResourceSpec workerResourceSpec = workerResourceSpecs.remove(resourceId);
         tryRemovePreviousPendingRecoveryTaskManager(resourceId);
         if (workerResourceSpec != null) {

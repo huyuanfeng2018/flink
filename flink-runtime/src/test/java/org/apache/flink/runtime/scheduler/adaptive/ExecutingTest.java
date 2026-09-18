@@ -126,6 +126,53 @@ class ExecutingTest {
             TestingUtils.defaultExecutorExtension();
 
     @Test
+    void testPlannedEvictionRestartsWithCurrentParallelismWithoutFailurePolicy() throws Exception {
+        try (MockExecutingContext ctx = new MockExecutingContext()) {
+            final MockExecutionJobVertex vertex =
+                    new MockExecutionJobVertex(MockExecutionVertex::new);
+            final ExecutionGraph graph =
+                    new MockExecutionGraph(() -> Collections.singletonList(vertex));
+            final Executing executing =
+                    new ExecutingStateBuilder().setExecutionGraph(graph).build(ctx);
+            ctx.setHowToHandleFailure(
+                    failure -> {
+                        throw new AssertionError("Not a failure restart");
+                    });
+            ctx.setExpectRestarting(
+                    arguments -> {
+                        assertThat(arguments.getBackoffTime()).isEqualTo(Duration.ZERO);
+                        assertThat(arguments.getRestartWithParallelism()).isPresent();
+                        assertThat(
+                                        arguments
+                                                .getRestartWithParallelism()
+                                                .get()
+                                                .getParallelism(vertex.getJobVertexId()))
+                                .isEqualTo(vertex.getParallelism());
+                    });
+            executing.restartForTaskManagerEviction();
+        }
+    }
+
+    @Test
+    void testReplacementResourcesDoNotTriggerIndependentRescaling() throws Exception {
+        try (MockExecutingContext ctx =
+                new MockExecutingContext() {
+                    @Override
+                    public boolean isTaskManagerEvictionInProgress() {
+                        return true;
+                    }
+                }) {
+            ctx.setHasDesiredResources(() -> true);
+            ctx.setHasSufficientResources(() -> true);
+            ctx.setVertexParallelism(
+                    new VertexParallelism(Collections.singletonMap(new JobVertexID(), 100)));
+            final Executing executing = new ExecutingStateBuilder().build(ctx);
+            assertThat(executing.hasDesiredResources()).isFalse();
+            assertThat(executing.hasSufficientResources()).isFalse();
+        }
+    }
+
+    @Test
     void testExecutionGraphDeploymentOnEnter() throws Exception {
         try (MockExecutingContext ctx = new MockExecutingContext()) {
             MockExecutionJobVertex mockExecutionJobVertex =

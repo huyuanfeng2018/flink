@@ -34,6 +34,7 @@ import org.apache.flink.runtime.checkpoint.TaskStateSnapshot;
 import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
 import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
+import org.apache.flink.runtime.executiongraph.ExecutionGraph;
 import org.apache.flink.runtime.executiongraph.TaskExecutionStateTransition;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
@@ -61,6 +62,7 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -79,6 +81,25 @@ public interface SchedulerNG extends GlobalFailureHandler, AutoCloseableAsync {
      * job.
      */
     JobManagerOptions.SchedulerType getSchedulerType();
+
+    /** Installs the job-scoped cooperative eviction coordinator before scheduling starts. */
+    default void setTaskManagerEvictionCoordinator(TaskManagerEvictionCoordinator coordinator) {
+        throw new UnsupportedOperationException(
+                "Cooperative TaskManager eviction is not supported.");
+    }
+
+    /** Returns the live graph, if this scheduler currently owns one. */
+    default Optional<ExecutionGraph> getExecutionGraphForTaskManagerEviction() {
+        return Optional.empty();
+    }
+
+    /** Starts a planned restart without consulting or consuming the failure restart policy. */
+    default boolean restartForTaskManagerEviction() {
+        return false;
+    }
+
+    /** Allows ordinary resource-driven scheduling to resume after a replacement cycle. */
+    default void onTaskManagerEvictionFinished() {}
 
     void startScheduling();
 

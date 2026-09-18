@@ -44,6 +44,9 @@ public interface ResourceEventHandler<WorkerType extends ResourceIDRetrievable> 
      */
     void onWorkerTerminated(ResourceID resourceId, String diagnostics);
 
+    /** Reports an eviction intent, not a worker failure or a request to terminate immediately. */
+    default void onWorkerPendingEviction(ResourceID resourceId) {}
+
     /**
      * Notifies that an error has occurred that the process cannot proceed.
      *

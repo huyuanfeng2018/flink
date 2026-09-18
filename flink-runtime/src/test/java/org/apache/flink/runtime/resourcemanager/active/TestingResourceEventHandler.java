@@ -33,14 +33,17 @@ public class TestingResourceEventHandler<WorkerType extends ResourceIDRetrievabl
     private final Consumer<Collection<WorkerType>> onPreviousAttemptWorkersRecoveredConsumer;
     private final BiConsumer<ResourceID, String> onWorkerTerminatedConsumer;
     private final Consumer<Throwable> onErrorConsumer;
+    private final Consumer<ResourceID> onWorkerPendingEvictionConsumer;
 
     private TestingResourceEventHandler(
             Consumer<Collection<WorkerType>> onPreviousAttemptWorkersRecoveredConsumer,
             BiConsumer<ResourceID, String> onWorkerTerminatedConsumer,
-            Consumer<Throwable> onErrorConsumer) {
+            Consumer<Throwable> onErrorConsumer,
+            Consumer<ResourceID> onWorkerPendingEvictionConsumer) {
         this.onPreviousAttemptWorkersRecoveredConsumer = onPreviousAttemptWorkersRecoveredConsumer;
         this.onWorkerTerminatedConsumer = onWorkerTerminatedConsumer;
         this.onErrorConsumer = onErrorConsumer;
+        this.onWorkerPendingEvictionConsumer = onWorkerPendingEvictionConsumer;
     }
 
     @Override
@@ -51,6 +54,11 @@ public class TestingResourceEventHandler<WorkerType extends ResourceIDRetrievabl
     @Override
     public void onWorkerTerminated(ResourceID resourceId, String diagnostics) {
         onWorkerTerminatedConsumer.accept(resourceId, diagnostics);
+    }
+
+    @Override
+    public void onWorkerPendingEviction(ResourceID resourceId) {
+        onWorkerPendingEvictionConsumer.accept(resourceId);
     }
 
     @Override
@@ -69,6 +77,13 @@ public class TestingResourceEventHandler<WorkerType extends ResourceIDRetrievabl
         private BiConsumer<ResourceID, String> onWorkerTerminatedConsumer =
                 (ignore1, ignore2) -> {};
         private Consumer<Throwable> onErrorConsumer = (ignore) -> {};
+        private Consumer<ResourceID> onWorkerPendingEvictionConsumer = (ignore) -> {};
+
+        public Builder<WorkerType> setOnWorkerPendingEvictionConsumer(
+                Consumer<ResourceID> consumer) {
+            onWorkerPendingEvictionConsumer = Preconditions.checkNotNull(consumer);
+            return this;
+        }
 
         private Builder() {}
 
@@ -95,7 +110,8 @@ public class TestingResourceEventHandler<WorkerType extends ResourceIDRetrievabl
             return new TestingResourceEventHandler<>(
                     onPreviousAttemptWorkersRecoveredConsumer,
                     onWorkerTerminatedConsumer,
-                    onErrorConsumer);
+                    onErrorConsumer,
+                    onWorkerPendingEvictionConsumer);
         }
     }
 }

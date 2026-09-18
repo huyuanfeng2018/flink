@@ -149,6 +149,12 @@ public class BlocklistDeclarativeSlotPool extends DefaultDeclarativeSlotPool {
         }
     }
 
+    @Override
+    protected boolean isExcludedFromEvictionCapacity(ResourceID taskManager) {
+        return super.isExcludedFromEvictionCapacity(taskManager)
+                || blockedTaskManagerChecker.isBlockedTaskManager(taskManager);
+    }
+
     private boolean isBlockedTaskManager(ResourceID resourceID) {
         return blockedTaskManagerChecker.isBlockedTaskManager(resourceID);
     }

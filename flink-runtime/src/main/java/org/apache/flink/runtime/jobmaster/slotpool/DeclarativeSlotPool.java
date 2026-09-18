@@ -31,6 +31,7 @@ import org.apache.flink.runtime.util.ResourceCounter;
 import javax.annotation.Nullable;
 
 import java.util.Collection;
+import java.util.Set;
 
 /**
  * Slot pool interface which uses Flink's declarative resource management protocol to acquire
@@ -48,6 +49,36 @@ public interface DeclarativeSlotPool {
      * @return True if the resources request is stable, false else.
      */
     boolean isResourceRequestStable();
+
+    /** Stops new allocations on the given TMs, preserving slots with running payloads. */
+    default Set<ResourceID> markTaskManagersForEviction(Collection<ResourceID> taskManagers) {
+        throw new UnsupportedOperationException("TaskManager eviction is not supported.");
+    }
+
+    /** Pins normal demand across cancellation and adds demand for still-held draining slots. */
+    default void beginTaskManagerEviction() {
+        throw new UnsupportedOperationException("TaskManager eviction is not supported.");
+    }
+
+    /** Removes only temporary demand. The allocation exclusion remains until the TM disappears. */
+    default void finishTaskManagerEviction() {
+        throw new UnsupportedOperationException("TaskManager eviction is not supported.");
+    }
+
+    /** Whether healthy, accepted slots can satisfy the pinned normal demand. */
+    default boolean hasSufficientResourcesForTaskManagerEviction() {
+        return false;
+    }
+
+    /** Whether this TM has a non-revocable eviction intent. */
+    default boolean isTaskManagerPendingEviction(ResourceID taskManager) {
+        return false;
+    }
+
+    /** Scheduling view, excluding slots on draining TMs (including occupied slots). */
+    default Collection<? extends SlotInfo> getSlotsInformationForScheduling() {
+        return getAllSlotsInformation();
+    }
 
     /**
      * Increases the resource requirements by increment.

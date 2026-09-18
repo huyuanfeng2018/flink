@@ -77,6 +77,17 @@ public interface JobMasterGateway
      */
     CompletableFuture<Acknowledge> cancel(@RpcTimeout Duration timeout);
 
+    /** Receives non-revocable worker eviction intents from the currently connected RM leader. */
+    default CompletableFuture<Acknowledge> notifyTaskManagersPendingEviction(
+            ResourceManagerId resourceManagerId,
+            Collection<ResourceID> taskManagers,
+            @RpcTimeout Duration timeout) {
+        final CompletableFuture<Acknowledge> result = new CompletableFuture<>();
+        result.completeExceptionally(
+                new UnsupportedOperationException("TaskManager eviction is not supported."));
+        return result;
+    }
+
     /**
      * Updates the task execution state for a given task.
      *

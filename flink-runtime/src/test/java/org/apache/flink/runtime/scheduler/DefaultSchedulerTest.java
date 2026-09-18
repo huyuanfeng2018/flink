@@ -221,6 +221,26 @@ public class DefaultSchedulerTest {
     }
 
     @Test
+    void testPlannedTaskManagerEvictionDoesNotConsumeFailureRestartBudget() {
+        testRestartBackoffTimeStrategy.setCanRestart(false);
+        testRestartBackoffTimeStrategy.setIsNewAttempt(
+                () -> {
+                    throw new AssertionError(
+                            "A planned restart must not notify the failure restart strategy.");
+                });
+        final DefaultScheduler scheduler =
+                createSchedulerAndStartScheduling(singleNonParallelJobVertexJobGraph());
+        final ExecutionAttemptID original = testExecutionOperations.getDeployedExecutions().get(0);
+        assertThat(scheduler.restartForTaskManagerEviction()).isTrue();
+        assertThat(scheduler.restartForTaskManagerEviction()).isFalse();
+        scheduler.updateTaskExecutionState(
+                new TaskExecutionState(original, ExecutionState.CANCELED));
+        assertThat(testExecutionOperations.getDeployedExecutions()).hasSize(2);
+        assertThat(scheduler.requestJobStatus()).isEqualTo(JobStatus.RUNNING);
+        assertThat(scheduler.getNumberOfRestarts()).isEqualTo(1);
+    }
+
+    @Test
     void startScheduling() {
         final JobGraph jobGraph = singleNonParallelJobVertexJobGraph();
         final JobVertex onlyJobVertex = getOnlyJobVertex(jobGraph);

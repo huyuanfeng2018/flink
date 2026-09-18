@@ -107,6 +107,7 @@ import org.apache.flink.runtime.scheduler.OperatorCoordinatorHandler;
 import org.apache.flink.runtime.scheduler.SchedulerBase;
 import org.apache.flink.runtime.scheduler.SchedulerNG;
 import org.apache.flink.runtime.scheduler.SchedulerUtils;
+import org.apache.flink.runtime.scheduler.TaskManagerEvictionCoordinator;
 import org.apache.flink.runtime.scheduler.UpdateSchedulerNgOnInternalFailuresListener;
 import org.apache.flink.runtime.scheduler.VertexParallelismInformation;
 import org.apache.flink.runtime.scheduler.VertexParallelismStore;
@@ -461,6 +462,9 @@ public class AdaptiveScheduler
 
     private final BoundedFIFOQueue<RootExceptionHistoryEntry> exceptionHistory;
     private JobGraphJobInformation jobInformation;
+    @Nullable private TaskManagerEvictionCoordinator taskManagerEvictionCoordinator;
+    @Nullable private JobGraphJobInformation evictionJobInformation;
+    private boolean plannedTaskManagerRestart;
     private ResourceCounter desiredResources = ResourceCounter.empty();
 
     private final JobManagerJobMetricGroup jobManagerJobMetricGroup;
@@ -920,6 +924,61 @@ public class AdaptiveScheduler
     }
 
     @Override
+    public void setTaskManagerEvictionCoordinator(TaskManagerEvictionCoordinator coordinator) {
+        Preconditions.checkState(
+                taskManagerEvictionCoordinator == null,
+                "Eviction coordinator is already installed.");
+        taskManagerEvictionCoordinator = Preconditions.checkNotNull(coordinator);
+    }
+
+    @Override
+    public Optional<ExecutionGraph> getExecutionGraphForTaskManagerEviction() {
+        return state.as(StateWithExecutionGraph.class)
+                .map(StateWithExecutionGraph::getExecutionGraph);
+    }
+
+    @Override
+    public boolean restartForTaskManagerEviction() {
+        final Optional<Executing> executing = state.as(Executing.class);
+        if (!executing.isPresent()) {
+            return false;
+        }
+        plannedTaskManagerRestart = true;
+        try {
+            executing.get().restartForTaskManagerEviction();
+        } finally {
+            plannedTaskManagerRestart = false;
+        }
+        return true;
+    }
+
+    @Override
+    public boolean isTaskManagerEvictionInProgress() {
+        return taskManagerEvictionCoordinator != null && taskManagerEvictionCoordinator.isActive();
+    }
+
+    @Override
+    public void onTaskManagerEvictionFinished() {
+        evictionJobInformation = null;
+        state.tryRun(
+                ResourceListener.class,
+                ResourceListener::onNewResourcesAvailable,
+                "Current state does not react to available resources.");
+    }
+
+    private JobGraphJobInformation getSchedulingJobInformation() {
+        return isTaskManagerEvictionInProgress() && evictionJobInformation != null
+                ? evictionJobInformation
+                : jobInformation;
+    }
+
+    private Collection<? extends SlotInfo> getSlotsForScheduling() {
+        return taskManagerEvictionCoordinator == null
+                ? declarativeSlotPool.getAllSlotsInformation()
+                : declarativeSlotPool.getSlotsInformationForScheduling();
+    }
+
+    @Override
     public JobStatus requestJobStatus() {
         return state.getJobStatus();
     }
@@ -1145,6 +1204,9 @@ public class AdaptiveScheduler
 
     @Override
     public void updateJobResourceRequirements(JobResourceRequirements jobResourceRequirements) {
+        Preconditions.checkState(
+                !isTaskManagerEvictionInProgress(),
+                "A TaskManager replacement is in progress. Retry the parallelism update after it completes.");
         if (settings.getExecutionMode() == SchedulerExecutionMode.REACTIVE) {
             throw new UnsupportedOperationException(
                     "Cannot change the parallelism of a job running in reactive mode.");
@@ -1189,7 +1251,7 @@ public class AdaptiveScheduler
 
     @Override
     public boolean hasDesiredResources() {
-        return hasDesiredResources(desiredResources, declarativeSlotPool.getAllSlotsInformation());
+        return hasDesiredResources(desiredResources, getSlotsForScheduling());
     }
 
     @VisibleForTesting
@@ -1215,7 +1277,7 @@ public class AdaptiveScheduler
     @Override
     public boolean hasSufficientResources() {
         return slotAllocator
-                .determineParallelism(jobInformation, declarativeSlotPool.getAllSlotsInformation())
+                .determineParallelism(getSchedulingJobInformation(), getSlotsForScheduling())
                 .isPresent();
     }
 
@@ -1239,7 +1301,7 @@ public class AdaptiveScheduler
 
         return slotAllocator
                 .determineParallelismAndCalculateAssignment(
-                        jobInformation,
+                        getSchedulingJobInformation(),
                         declarativeSlotPool.getFreeSlotTracker().getFreeSlotsInformation(),
                         getJobAllocationsInformationFromGraphAndState(previousExecutionGraph))
                 .orElseThrow(
@@ -1370,7 +1432,24 @@ public class AdaptiveScheduler
             @Nullable VertexParallelism restartWithParallelism,
             List<ExceptionHistoryEntry> failureCollection) {
 
-        recordRescaleForJobRestarting(restartWithParallelism);
+        if (!plannedTaskManagerRestart) {
+            recordRescaleForJobRestarting(restartWithParallelism);
+        }
+        if (isTaskManagerEvictionInProgress()) {
+            final DefaultVertexParallelismStore store = new DefaultVertexParallelismStore();
+            executionGraph
+                    .getAllVertices()
+                    .forEach(
+                            (id, vertex) ->
+                                    store.setParallelismInfo(
+                                            id,
+                                            new DefaultVertexParallelismInfo(
+                                                    vertex.getParallelism(),
+                                                    vertex.getParallelism(),
+                                                    vertex.getMaxParallelism(),
+                                                    ignored -> Optional.empty())));
+            evictionJobInformation = new JobGraphJobInformation(jobGraph, store);
+        }
 
         for (ExecutionVertex executionVertex : executionGraph.getAllExecutionVertices()) {
             final int attemptNumber =
@@ -1395,7 +1474,7 @@ public class AdaptiveScheduler
                         failureCollection));
 
         numRestarts++;
-        if (failureCollection.isEmpty()) {
+        if (failureCollection.isEmpty() && !plannedTaskManagerRestart) {
             numRescales++;
         }
     }
@@ -1497,6 +1576,17 @@ public class AdaptiveScheduler
 
     @Override
     public void goToCreatingExecutionGraph(@Nullable ExecutionGraph previousExecutionGraph) {
+        if (taskManagerEvictionCoordinator != null
+                && !taskManagerEvictionCoordinator.isReadyToDeploy()) {
+            final State expectedState = state;
+            taskManagerEvictionCoordinator.runWhenReadyToDeploy(
+                    () -> {
+                        if (state == expectedState) {
+                            goToCreatingExecutionGraph(previousExecutionGraph);
+                        }
+                    });
+            return;
+        }
         final CompletableFuture<CreatingExecutionGraph.ExecutionGraphWithVertexParallelism>
                 executionGraphWithAvailableResourcesFuture =
                         createExecutionGraphWithAvailableResourcesAsync(previousExecutionGraph);
@@ -1554,6 +1644,11 @@ public class AdaptiveScheduler
                     executionGraphWithVertexParallelism) {
         final ExecutionGraph executionGraph =
                 executionGraphWithVertexParallelism.getExecutionGraph();
+
+        if (taskManagerEvictionCoordinator != null
+                && !taskManagerEvictionCoordinator.isReadyToDeploy()) {
+            return CreatingExecutionGraph.AssignmentResult.notPossible();
+        }
 
         executionGraph.start(componentMainThreadExecutor);
 
@@ -1640,7 +1735,7 @@ public class AdaptiveScheduler
     @Override
     public Optional<VertexParallelism> getAvailableVertexParallelism() {
         return slotAllocator.determineParallelism(
-                jobInformation, declarativeSlotPool.getAllSlotsInformation());
+                getSchedulingJobInformation(), getSlotsForScheduling());
     }
 
     @Override

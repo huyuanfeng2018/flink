@@ -29,6 +29,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 class KubernetesPodTest {
 
     @Test
+    void testPendingEvictionRequiresExplicitAnnotation() {
+        assertThat(
+                        new KubernetesPod(new PodBuilder().withNewMetadata().endMetadata().build())
+                                .isPendingEviction())
+                .isFalse();
+        for (String value : new String[] {"false", "TRUE", "", "true"}) {
+            final KubernetesPod pod =
+                    new KubernetesPod(
+                            new PodBuilder()
+                                    .withNewMetadata()
+                                    .addToAnnotations(
+                                            KubernetesPod.PENDING_EVICTION_ANNOTATION, value)
+                                    .endMetadata()
+                                    .build());
+            assertThat(pod.isPendingEviction()).isEqualTo("true".equals(value));
+        }
+    }
+
+    @Test
     void testIsTerminatedShouldReturnTrueWhenPodFailed() {
         final Pod pod = new PodBuilder().build();
         pod.setStatus(

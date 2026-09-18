@@ -18,6 +18,8 @@
 
 package org.apache.flink.kubernetes;
 
+import org.apache.flink.configuration.DeploymentOptions;
+import org.apache.flink.configuration.TaskManagerEvictionOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.core.testutils.FlinkAssertions;
 import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
@@ -62,6 +64,75 @@ class KubernetesResourceManagerDriverTest
     private static final KubernetesResourceManagerDriverConfiguration
             KUBERNETES_RESOURCE_MANAGER_CONFIGURATION =
                     new KubernetesResourceManagerDriverConfiguration(CLUSTER_ID, "localhost:9000");
+
+    @Test
+    void testEvictionIntentRecoveredAndObservedOnModifiedPodWithoutStoppingWorker()
+            throws Exception {
+        new Context() {
+            {
+                flinkConfig.set(TaskManagerEvictionOptions.ENABLED, true);
+                flinkConfig.set(DeploymentOptions.TARGET, "kubernetes-application");
+                final KubernetesPod draining =
+                        new TestingKubernetesPod(CLUSTER_ID + "-taskmanager-1-1") {
+                            @Override
+                            public boolean isPendingEviction() {
+                                return true;
+                            }
+                        };
+                final List<ResourceID> notifications = new ArrayList<>();
+                final List<String> stopped = new ArrayList<>();
+                resourceEventHandlerBuilder.setOnWorkerPendingEvictionConsumer(notifications::add);
+                flinkKubeClientBuilder.setGetPodsWithLabelsFunction(
+                        ignored -> Collections.singletonList(draining));
+                flinkKubeClientBuilder.setStopPodFunction(
+                        name -> {
+                            stopped.add(name);
+                            return FutureUtils.completedVoidFuture();
+                        });
+                runTest(
+                        () -> {
+                            assertThat(notifications)
+                                    .containsExactly(new ResourceID(draining.getName()));
+                            getPodCallbackHandler().onModified(Collections.singletonList(draining));
+                            runInMainThread(
+                                            () -> {
+                                                assertThat(notifications)
+                                                        .containsExactly(
+                                                                new ResourceID(draining.getName()),
+                                                                new ResourceID(draining.getName()));
+                                                assertThat(stopped).isEmpty();
+                                            })
+                                    .get(TIMEOUT_SEC, TimeUnit.SECONDS);
+                        });
+            }
+        };
+    }
+
+    @Test
+    void testEvictionAnnotationIgnoredWhenFeatureIsDisabled() throws Exception {
+        new Context() {
+            {
+                final KubernetesPod draining =
+                        new TestingKubernetesPod(CLUSTER_ID + "-taskmanager-1-1") {
+                            @Override
+                            public boolean isPendingEviction() {
+                                return true;
+                            }
+                        };
+                resourceEventHandlerBuilder.setOnWorkerPendingEvictionConsumer(
+                        ignored -> {
+                            throw new AssertionError("Eviction feature is disabled");
+                        });
+                flinkKubeClientBuilder.setGetPodsWithLabelsFunction(
+                        ignored -> Collections.singletonList(draining));
+                runTest(
+                        () -> {
+                            getPodCallbackHandler().onModified(Collections.singletonList(draining));
+                            runInMainThread(() -> {}).get(TIMEOUT_SEC, TimeUnit.SECONDS);
+                        });
+            }
+        };
+    }
 
     @Test
     void testCancelRequestedResource() throws Exception {

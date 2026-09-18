@@ -36,6 +36,11 @@ public class TestingKubernetesPod extends KubernetesPod {
     }
 
     @Override
+    public boolean isPendingEviction() {
+        return false;
+    }
+
+    @Override
     public String getName() {
         return name;
     }

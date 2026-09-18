@@ -390,6 +390,7 @@ public class FineGrainedSlotManager implements SlotManager {
         } else {
             Optional<PendingTaskManager> matchedPendingTaskManagerOptional =
                     initialSlotReport.hasAllocatedSlot()
+                                    || isBlockedTaskManager(taskExecutorConnection.getResourceID())
                             ? Optional.empty()
                             : findMatchingPendingTaskManager(
                                     totalResourceProfile, defaultSlotResourceProfile);

@@ -23,6 +23,7 @@ import org.apache.flink.annotation.VisibleForTesting;
 import io.fabric8.kubernetes.api.model.ContainerStateTerminated;
 import io.fabric8.kubernetes.api.model.Pod;
 
+import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
@@ -31,6 +32,14 @@ public class KubernetesPod extends KubernetesResource<Pod> {
 
     public KubernetesPod(Pod pod) {
         super(pod);
+    }
+
+    public static final String PENDING_EVICTION_ANNOTATION = "flink/pending-eviction";
+
+    public boolean isPendingEviction() {
+        final Map<String, String> annotations =
+                getInternalResource().getMetadata().getAnnotations();
+        return annotations != null && "true".equals(annotations.get(PENDING_EVICTION_ANNOTATION));
     }
 
     public String getName() {

@@ -173,6 +173,8 @@ public abstract class ResourceManager<WorkerType extends ResourceIDRetrievable>
 
     protected final BlocklistHandler blocklistHandler;
 
+    private final PendingTaskManagerEvictions pendingTaskManagerEvictions;
+
     private final AtomicReference<byte[]> latestTokens = new AtomicReference<>();
 
     private final ResourceAllocator resourceAllocator;
@@ -244,6 +246,9 @@ public abstract class ResourceManager<WorkerType extends ResourceIDRetrievable>
         this.delegationTokenManager = delegationTokenManager;
 
         this.resourceAllocator = getResourceAllocator();
+        this.pendingTaskManagerEvictions =
+                new PendingTaskManagerEvictions(
+                        getFencingToken(), getMainThreadExecutor(), rpcTimeout);
     }
 
     // ------------------------------------------------------------------------
@@ -279,7 +284,9 @@ public abstract class ResourceManager<WorkerType extends ResourceIDRetrievable>
                     getMainThreadExecutor(),
                     resourceAllocator,
                     new ResourceEventListenerImpl(),
-                    blocklistHandler::isBlockedTaskManager);
+                    taskManager ->
+                            blocklistHandler.isBlockedTaskManager(taskManager)
+                                    || pendingTaskManagerEvictions.contains(taskManager));
 
             delegationTokenManager.start(this);
 
@@ -321,6 +328,7 @@ public abstract class ResourceManager<WorkerType extends ResourceIDRetrievable>
     }
 
     private void stopResourceManagerServices() throws Exception {
+        pendingTaskManagerEvictions.close();
         Exception exception = null;
 
         try {
@@ -960,6 +968,18 @@ public abstract class ResourceManager<WorkerType extends ResourceIDRetrievable>
         }
     }
 
+    protected final void notifyWorkerPendingEviction(ResourceID taskManager) {
+        validateRunsInMainThread();
+        if (pendingTaskManagerEvictions.add(taskManager)) {
+            log.info("TaskManager {} is pending cooperative eviction.", taskManager);
+            slotManager.triggerResourceRequirementsCheck();
+        }
+    }
+
+    protected final void forgetWorkerEviction(ResourceID taskManager) {
+        pendingTaskManagerEvictions.remove(taskManager);
+    }
+
     @Override
     public CompletableFuture<Acknowledge> notifyNewBlockedNodes(Collection<BlockedNode> newNodes) {
         blocklistHandler.addNewBlockedNodes(newNodes);
@@ -1029,6 +1049,7 @@ public abstract class ResourceManager<WorkerType extends ResourceIDRetrievable>
                 jobManagerAddress,
                 jobId);
 
+        pendingTaskManagerEvictions.register(jobMasterGateway);
         jobManagerHeartbeatManager.monitorTarget(
                 jobManagerResourceId, new JobMasterHeartbeatSender(jobMasterGateway));
 
@@ -1154,6 +1175,7 @@ public abstract class ResourceManager<WorkerType extends ResourceIDRetrievable>
 
             jmResourceIdRegistrations.remove(jobManagerResourceId);
             blocklistHandler.deregisterBlocklistListener(jobMasterGateway);
+            pendingTaskManagerEvictions.unregister(jobMasterGateway);
 
             if (resourceRequirementHandling == ResourceRequirementHandling.CLEAR) {
                 slotManager.clearResourceRequirements(jobId);

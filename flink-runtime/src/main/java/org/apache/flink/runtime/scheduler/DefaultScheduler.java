@@ -92,6 +92,9 @@ public class DefaultScheduler extends SchedulerBase implements SchedulerOperatio
 
     private final ExecutionFailureHandler executionFailureHandler;
 
+    @Nullable private TaskManagerEvictionCoordinator taskManagerEvictionCoordinator;
+    private long plannedTaskManagerRestarts;
+
     private final ScheduledExecutor delayExecutor;
 
     protected final SchedulingStrategy schedulingStrategy;
@@ -224,7 +227,40 @@ public class DefaultScheduler extends SchedulerBase implements SchedulerOperatio
 
     @Override
     protected long getNumberOfRestarts() {
-        return executionFailureHandler.getNumberOfRestarts();
+        return executionFailureHandler.getNumberOfRestarts() + plannedTaskManagerRestarts;
+    }
+
+    @Override
+    public void setTaskManagerEvictionCoordinator(TaskManagerEvictionCoordinator coordinator) {
+        checkState(
+                taskManagerEvictionCoordinator == null,
+                "Eviction coordinator is already installed.");
+        taskManagerEvictionCoordinator = checkNotNull(coordinator);
+    }
+
+    @Override
+    public Optional<org.apache.flink.runtime.executiongraph.ExecutionGraph>
+            getExecutionGraphForTaskManagerEviction() {
+        return Optional.of(getExecutionGraph());
+    }
+
+    @Override
+    public boolean restartForTaskManagerEviction() {
+        if (requestJobStatus() != JobStatus.RUNNING || !verticesWaitingForRestart.isEmpty()) {
+            return false;
+        }
+        final Set<ExecutionVertexID> vertices = new HashSet<>();
+        getSchedulingTopology().getVertices().forEach(vertex -> vertices.add(vertex.getId()));
+        final Set<ExecutionVertexVersion> versions =
+                new HashSet<>(
+                        executionVertexVersioner.recordVertexModifications(vertices).values());
+        addVerticesToRestartPending(vertices);
+        plannedTaskManagerRestarts++;
+        log.info("Restarting {} tasks for cooperative TaskManager eviction.", vertices.size());
+        FutureUtils.assertNoException(
+                cancelTasksAsync(vertices)
+                        .thenRunAsync(() -> restartTasks(versions, true), getMainThreadExecutor()));
+        return true;
     }
 
     @Override
@@ -419,6 +455,13 @@ public class DefaultScheduler extends SchedulerBase implements SchedulerOperatio
                 executionVertexVersioner.getUnmodifiedExecutionVertices(executionVertexVersions);
 
         if (verticesToRestart.isEmpty()) {
+            return;
+        }
+
+        if (taskManagerEvictionCoordinator != null
+                && !taskManagerEvictionCoordinator.isReadyToDeploy()) {
+            taskManagerEvictionCoordinator.runWhenReadyToDeploy(
+                    () -> restartTasks(executionVertexVersions, isGlobalRecovery));
             return;
         }
 
