@@ -209,6 +209,23 @@ public class TestingJobMasterGateway implements JobMasterGateway {
     private final Function<JobResourceRequirements, CompletableFuture<Acknowledge>>
             updateJobResourceRequirementsFunction;
 
+    private Function<Collection<ResourceID>, CompletableFuture<Acknowledge>>
+            notifyTaskManagersPendingEvictionFunction =
+                    ignored -> CompletableFuture.completedFuture(Acknowledge.get());
+
+    public void setNotifyTaskManagersPendingEvictionFunction(
+            Function<Collection<ResourceID>, CompletableFuture<Acknowledge>> function) {
+        this.notifyTaskManagersPendingEvictionFunction = function;
+    }
+
+    @Override
+    public CompletableFuture<Acknowledge> notifyTaskManagersPendingEviction(
+            ResourceManagerId resourceManagerId,
+            Collection<ResourceID> taskManagers,
+            Duration timeout) {
+        return notifyTaskManagersPendingEvictionFunction.apply(taskManagers);
+    }
+
     public TestingJobMasterGateway(
             @Nonnull String address,
             @Nonnull String hostname,

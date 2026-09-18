@@ -25,7 +25,6 @@ import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.TaskManagerEvictionOptions;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.runtime.checkpoint.CheckpointCoordinator;
-import org.apache.flink.runtime.checkpoint.CheckpointStatsSnapshot;
 import org.apache.flink.runtime.checkpoint.CompletedCheckpoint;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.execution.ExecutionState;
@@ -67,6 +66,18 @@ public final class TaskManagerEvictionCoordinator implements AutoCloseable {
         JobStatus getJobStatus();
 
         Optional<ExecutionGraph> getExecutionGraph();
+
+        @Nullable
+        default CheckpointCoordinator getCheckpointCoordinator() {
+            return getExecutionGraph().map(ExecutionGraph::getCheckpointCoordinator).orElse(null);
+        }
+
+        default long getFailedCheckpointCount() {
+            return getExecutionGraph()
+                    .map(ExecutionGraph::getCheckpointStatsSnapshot)
+                    .map(snapshot -> snapshot.getCounts().getNumberOfFailedCheckpoints())
+                    .orElse(0L);
+        }
 
         boolean restart();
 
@@ -277,9 +288,9 @@ public final class TaskManagerEvictionCoordinator implements AutoCloseable {
                     && now - firstIntentTime < maxBatchWaitMillis) {
                 return;
             }
-            enterCheckpointWait(graph.get(), now);
+            enterCheckpointWait(now);
         }
-        evaluateCheckpoint(graph.get(), now);
+        evaluateCheckpoint(now);
     }
 
     private boolean allTasksRunning(ExecutionGraph graph) {
@@ -304,10 +315,10 @@ public final class TaskManagerEvictionCoordinator implements AutoCloseable {
         return false;
     }
 
-    private void enterCheckpointWait(ExecutionGraph graph, long now) {
+    private void enterCheckpointWait(long now) {
         resourcesReadyTime = clock.absoluteTimeMillis();
         checkpointIdBeforeReady = -1;
-        final CheckpointCoordinator coordinator = graph.getCheckpointCoordinator();
+        final CheckpointCoordinator coordinator = context.getCheckpointCoordinator();
         if (coordinator != null) {
             final CompletedCheckpoint latest =
                     coordinator.getCheckpointStore().getLatestCheckpoint();
@@ -323,18 +334,13 @@ public final class TaskManagerEvictionCoordinator implements AutoCloseable {
                     now > Long.MAX_VALUE - maxCheckpointWaitMillis
                             ? Long.MAX_VALUE
                             : now + maxCheckpointWaitMillis;
-            checkpointFailuresBeforeWait = failedCheckpoints(graph);
+            checkpointFailuresBeforeWait = context.getFailedCheckpointCount();
         }
         phase = Phase.WAITING_CHECKPOINT;
     }
 
-    private long failedCheckpoints(ExecutionGraph graph) {
-        final CheckpointStatsSnapshot snapshot = graph.getCheckpointStatsSnapshot();
-        return snapshot == null ? 0 : snapshot.getCounts().getNumberOfFailedCheckpoints();
-    }
-
-    private void evaluateCheckpoint(ExecutionGraph graph, long now) {
-        final CheckpointCoordinator coordinator = graph.getCheckpointCoordinator();
+    private void evaluateCheckpoint(long now) {
+        final CheckpointCoordinator coordinator = context.getCheckpointCoordinator();
         final CompletedCheckpoint latest =
                 coordinator == null ? null : coordinator.getCheckpointStore().getLatestCheckpoint();
         final boolean fresh =
@@ -343,7 +349,7 @@ public final class TaskManagerEvictionCoordinator implements AutoCloseable {
                         && latest.getTimestamp() >= resourcesReadyTime;
         final boolean fallback =
                 now >= checkpointDeadline
-                        || failedCheckpoints(graph) - checkpointFailuresBeforeWait
+                        || context.getFailedCheckpointCount() - checkpointFailuresBeforeWait
                                 >= maxCheckpointFailures;
         if ((fresh || fallback) && latest != null) {
             // Recheck immediately before cancellation. A timeout never waives resource safety.

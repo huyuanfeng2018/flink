@@ -24,18 +24,41 @@ import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.TaskManagerEvictionOptions;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.runtime.checkpoint.CheckpointCoordinator;
-import org.apache.flink.runtime.checkpoint.CheckpointStatsCounts;
-import org.apache.flink.runtime.checkpoint.CheckpointStatsSnapshot;
+import org.apache.flink.runtime.checkpoint.CheckpointCoordinatorTestingUtils.CheckpointCoordinatorBuilder;
+import org.apache.flink.runtime.checkpoint.CheckpointProperties;
+import org.apache.flink.runtime.checkpoint.CheckpointRetentionPolicy;
+import org.apache.flink.runtime.checkpoint.CheckpointsCleaner;
 import org.apache.flink.runtime.checkpoint.CompletedCheckpoint;
-import org.apache.flink.runtime.checkpoint.CompletedCheckpointStore;
+import org.apache.flink.runtime.checkpoint.DefaultCheckpointStatsTracker;
 import org.apache.flink.runtime.checkpoint.PendingCheckpoint;
+import org.apache.flink.runtime.checkpoint.StandaloneCheckpointIDCounter;
+import org.apache.flink.runtime.checkpoint.StandaloneCompletedCheckpointStore;
+import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
+import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
+import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutorServiceAdapter;
 import org.apache.flink.runtime.execution.ExecutionState;
+import org.apache.flink.runtime.executiongraph.DefaultExecutionGraph;
 import org.apache.flink.runtime.executiongraph.ExecutionGraph;
 import org.apache.flink.runtime.executiongraph.ExecutionVertex;
-import org.apache.flink.runtime.jobmaster.slotpool.DeclarativeSlotPool;
+import org.apache.flink.runtime.executiongraph.TestingDefaultExecutionGraphBuilder;
+import org.apache.flink.runtime.executiongraph.utils.SimpleAckingTaskManagerGateway;
+import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobVertex;
+import org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration;
+import org.apache.flink.runtime.jobmaster.TestingLogicalSlotBuilder;
+import org.apache.flink.runtime.jobmaster.slotpool.DefaultDeclarativeSlotPool;
+import org.apache.flink.runtime.jobmaster.slotpool.DefaultDeclarativeSlotPoolBuilder;
+import org.apache.flink.runtime.messages.checkpoint.AcknowledgeCheckpoint;
+import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
+import org.apache.flink.runtime.slots.ResourceRequirement;
+import org.apache.flink.runtime.state.testutils.TestCompletedCheckpointStorageLocation;
+import org.apache.flink.runtime.taskexecutor.slot.SlotOffer;
 import org.apache.flink.runtime.taskmanager.LocalTaskManagerLocation;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
+import org.apache.flink.runtime.testutils.DirectScheduledExecutorService;
+import org.apache.flink.runtime.util.ResourceCounter;
+import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.clock.ManualClock;
 import org.apache.flink.util.concurrent.ManuallyTriggeredScheduledExecutor;
 
@@ -43,25 +66,18 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.Optional;
-import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.apache.flink.runtime.executiongraph.ExecutionGraphTestUtils.createNoOpVertex;
+import static org.apache.flink.runtime.executiongraph.ExecutionGraphTestUtils.setVertexState;
+import static org.apache.flink.runtime.jobgraph.JobGraphTestUtils.streamingJobGraph;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyCollection;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
-/** Deterministic main-thread tests; time advances without sleeping or a live Kubernetes cluster. */
+/** Deterministic policy tests using real checkpoint, slot-pool and execution-graph components. */
 class TaskManagerEvictionCoordinatorTest {
     @Test
-    void repeatedIntentDoesNotRestartTheQuietWindow() {
+    void repeatedIntentDoesNotRestartTheQuietWindow() throws Exception {
         try (Fixture f = new Fixture()) {
             f.mark(f.oldLocation.getResourceID());
             f.advance(4);
@@ -69,13 +85,14 @@ class TaskManagerEvictionCoordinatorTest {
             f.advance(1);
             assertThat(f.coordinator.getPhase())
                     .isEqualTo(TaskManagerEvictionCoordinator.Phase.WAITING_CHECKPOINT);
-            verify(f.pool, times(1)).beginTaskManagerEviction();
+            assertThat(f.pool.getResourceRequirements())
+                    .containsExactly(ResourceRequirement.create(ResourceProfile.UNKNOWN, 2));
             assertThat(f.restarts).isZero();
         }
     }
 
     @Test
-    void continuousNewIntentsCannotExtendMaximumBatchWindow() {
+    void continuousNewIntentsCannotExtendMaximumBatchWindow() throws Exception {
         try (Fixture f = new Fixture()) {
             f.mark(f.oldLocation.getResourceID());
             for (int i = 0; i < 7; i++) {
@@ -89,14 +106,14 @@ class TaskManagerEvictionCoordinatorTest {
     }
 
     @Test
-    void timeoutNeverWaivesResourceReadiness() {
+    void timeoutNeverWaivesResourceReadiness() throws Exception {
         try (Fixture f = new Fixture()) {
-            f.ready = false;
+            f.setReady(false);
             f.mark(f.oldLocation.getResourceID());
             f.advance(100);
             assertThat(f.restarts).isZero();
             assertThat(f.status).isEqualTo(JobStatus.RUNNING);
-            f.ready = true;
+            f.setReady(true);
             f.coordinator.reconcile();
             f.advance(10);
             assertThat(f.restarts).isEqualTo(1);
@@ -104,10 +121,11 @@ class TaskManagerEvictionCoordinatorTest {
     }
 
     @Test
-    void checkpointStartedBeforeReadinessDoesNotCountAsFresh() {
+    void checkpointStartedBeforeReadinessDoesNotCountAsFresh() throws Exception {
         try (Fixture f = new Fixture()) {
-            when(f.checkpoints.getPendingCheckpoints())
-                    .thenReturn(Collections.singletonMap(2L, mock(PendingCheckpoint.class)));
+            f.checkpoints.triggerCheckpoint(false);
+            f.checkpointExecutor.triggerAll();
+            assertThat(f.checkpoints.getPendingCheckpoints()).containsOnlyKeys(2L);
             f.mark(f.oldLocation.getResourceID());
             f.advance(5);
             f.completed(2, 0);
@@ -121,40 +139,36 @@ class TaskManagerEvictionCoordinatorTest {
     }
 
     @Test
-    void timeoutIsNotResetWhenAnotherIntentMakesResourcesInsufficient() {
+    void timeoutIsNotResetWhenAnotherIntentMakesResourcesInsufficient() throws Exception {
         try (Fixture f = new Fixture()) {
             f.mark(f.oldLocation.getResourceID());
             f.advance(5);
             f.advance(8);
-            f.ready = false;
+            f.setReady(false);
             f.mark(ResourceID.generate());
             f.advance(2);
             assertThat(f.restarts).isZero();
-            f.ready = true;
+            f.setReady(true);
             f.advance(3);
             assertThat(f.restarts).isEqualTo(1);
         }
     }
 
     @Test
-    void consecutiveCheckpointFailuresAllowFallbackToRetainedState() {
+    void consecutiveCheckpointFailuresAllowFallbackToRetainedState() throws Exception {
         try (Fixture f = new Fixture()) {
-            final CheckpointStatsSnapshot stats = mock(CheckpointStatsSnapshot.class);
-            final CheckpointStatsCounts counts = mock(CheckpointStatsCounts.class);
-            when(stats.getCounts()).thenReturn(counts);
-            when(f.graph.getCheckpointStatsSnapshot()).thenReturn(stats);
             f.mark(f.oldLocation.getResourceID());
             f.advance(5);
-            when(counts.getNumberOfFailedCheckpoints()).thenReturn(2L);
+            f.stats.reportFailedCheckpointsWithoutInProgress();
+            f.stats.reportFailedCheckpointsWithoutInProgress();
             f.coordinator.reconcile();
             assertThat(f.restarts).isEqualTo(1);
         }
     }
 
     @Test
-    void missingRetainedCheckpointLeavesExistingTasksRunning() {
-        try (Fixture f = new Fixture()) {
-            when(f.store.getLatestCheckpoint()).thenReturn(null);
+    void missingRetainedCheckpointLeavesExistingTasksRunning() throws Exception {
+        try (Fixture f = new Fixture(false, false)) {
             f.mark(f.oldLocation.getResourceID());
             f.advance(5);
             f.advance(10);
@@ -169,34 +183,34 @@ class TaskManagerEvictionCoordinatorTest {
     }
 
     @Test
-    void newIntentDuringRecoveryHoldsRedeploymentUntilHealthyCapacityReturns() {
+    void newIntentDuringRecoveryHoldsRedeploymentUntilHealthyCapacityReturns() throws Exception {
         try (Fixture f = new Fixture()) {
             f.startRestart();
-            f.ready = false;
+            f.setReady(false);
             f.mark(ResourceID.generate());
             final AtomicInteger deployments = new AtomicInteger();
             f.coordinator.runWhenReadyToDeploy(deployments::incrementAndGet);
             f.coordinator.reconcile();
             assertThat(deployments).hasValue(0);
-            f.ready = true;
+            f.setReady(true);
             f.coordinator.reconcile();
             assertThat(deployments).hasValue(1);
             assertThat(f.restarts).isEqualTo(1);
             f.runningOn(new LocalTaskManagerLocation());
             f.coordinator.reconcile();
             assertThat(f.coordinator.isActive()).isFalse();
-            verify(f.pool).finishTaskManagerEviction();
+            assertThat(f.pool.getResourceRequirements())
+                    .containsExactly(ResourceRequirement.create(ResourceProfile.UNKNOWN, 1));
         }
     }
 
     @Test
-    void intentForAlreadyRedeployedTaskIsPreservedForNextRound() {
+    void intentForAlreadyRedeployedTaskIsPreservedForNextRound() throws Exception {
         try (Fixture f = new Fixture()) {
             f.startRestart();
             final TaskManagerLocation next = new LocalTaskManagerLocation();
-            f.mark(next.getResourceID());
             f.runningOn(next);
-            f.coordinator.reconcile();
+            f.mark(next.getResourceID());
             assertThat(f.coordinator.getPhase())
                     .isEqualTo(TaskManagerEvictionCoordinator.Phase.PREPARING);
             f.advance(5);
@@ -207,7 +221,7 @@ class TaskManagerEvictionCoordinatorTest {
     }
 
     @Test
-    void naturalRecoveryConsumesPendingIntentsWithoutAnotherPlannedRestart() {
+    void naturalRecoveryConsumesPendingIntentsWithoutAnotherPlannedRestart() throws Exception {
         try (Fixture f = new Fixture()) {
             f.mark(f.oldLocation.getResourceID());
             f.advance(5);
@@ -221,26 +235,28 @@ class TaskManagerEvictionCoordinatorTest {
     }
 
     @Test
-    void activeCheckpointHonorsMinPauseAndClosedEpochIgnoresCallback() {
-        try (Fixture f = new Fixture()) {
-            f.configuration.set(
-                    JobManagerOptions.SCHEDULER_RESCALE_TRIGGER_ACTIVE_CHECKPOINT_ENABLED, true);
-            f.recreateCoordinator();
-            final CompletableFuture<CompletedCheckpoint> checkpoint = new CompletableFuture<>();
-            when(f.checkpoints.triggerCheckpoint(false)).thenReturn(checkpoint);
-            when(f.checkpoints.isPeriodicCheckpointingConfigured()).thenReturn(true);
-            when(f.checkpoints.getActiveCheckpointTriggerDelay())
-                    .thenReturn(Optional.of(Duration.ofSeconds(1)));
+    void activeCheckpointHonorsMinPauseAndClosedEpochIgnoresCallback() throws Exception {
+        try (Fixture f = new Fixture(true, true)) {
             f.mark(f.oldLocation.getResourceID());
             f.advance(5);
-            verify(f.checkpoints, never()).triggerCheckpoint(false);
-            when(f.checkpoints.getActiveCheckpointTriggerDelay())
-                    .thenReturn(Optional.of(Duration.ZERO));
+            f.checkpointExecutor.triggerAll();
+            assertThat(f.checkpoints.getPendingCheckpoints()).isEmpty();
+            assertThat(f.checkpoints.getActiveCheckpointTriggerDelay())
+                    .contains(Duration.ofSeconds(1));
+            f.advance(1);
             f.coordinator.reconcile();
-            f.coordinator.reconcile();
-            verify(f.checkpoints, times(1)).triggerCheckpoint(false);
+            f.checkpointExecutor.triggerAll();
+            assertThat(f.checkpoints.getPendingCheckpoints()).hasSize(1);
+            final PendingCheckpoint pending =
+                    f.checkpoints.getPendingCheckpoints().values().iterator().next();
             f.coordinator.close();
-            checkpoint.complete(mock(CompletedCheckpoint.class));
+            f.checkpoints.receiveAcknowledgeMessage(
+                    new AcknowledgeCheckpoint(
+                            f.graph.getJobID(),
+                            f.vertex.getCurrentExecutionAttempt().getAttemptId(),
+                            pending.getCheckpointID()),
+                    "test TaskManager");
+            assertThat(pending.getCompletionFuture()).isCompleted();
             f.executor.triggerAll();
             f.executor.triggerNonPeriodicScheduledTasks();
             assertThat(f.restarts).isZero();
@@ -255,50 +271,81 @@ class TaskManagerEvictionCoordinatorTest {
         private final ManualClock clock = new ManualClock();
         private final ManuallyTriggeredScheduledExecutor executor =
                 new ManuallyTriggeredScheduledExecutor();
-        private final DeclarativeSlotPool pool = mock(DeclarativeSlotPool.class);
-        private final ExecutionGraph graph = mock(ExecutionGraph.class);
-        private final ExecutionVertex vertex = mock(ExecutionVertex.class);
-        private final CheckpointCoordinator checkpoints = mock(CheckpointCoordinator.class);
-        private final CompletedCheckpointStore store = mock(CompletedCheckpointStore.class);
+        private final ManuallyTriggeredScheduledExecutor checkpointExecutor =
+                new ManuallyTriggeredScheduledExecutor();
+        private final DirectScheduledExecutorService graphExecutor =
+                new DirectScheduledExecutorService();
+        private final DefaultDeclarativeSlotPool pool =
+                DefaultDeclarativeSlotPoolBuilder.builder()
+                        .setSlotRequestMaxInterval(Duration.ZERO)
+                        .build();
+        private final SimpleAckingTaskManagerGateway gateway =
+                new SimpleAckingTaskManagerGateway();
+        private final DefaultExecutionGraph graph;
+        private final ExecutionVertex vertex;
+        private final CheckpointCoordinator checkpoints;
+        private final StandaloneCheckpointIDCounter checkpointIds =
+                new StandaloneCheckpointIDCounter();
+        private final StandaloneCompletedCheckpointStore store =
+                new StandaloneCompletedCheckpointStore(1);
+        private final CheckpointsCleaner cleaner = new CheckpointsCleaner();
+        private final DefaultCheckpointStatsTracker stats =
+                new DefaultCheckpointStatsTracker(
+                        10, UnregisteredMetricGroups.createUnregisteredJobManagerJobMetricGroup());
         private final TaskManagerLocation oldLocation = new LocalTaskManagerLocation();
-        private final Set<ResourceID> marked = new HashSet<>();
-        private TaskManagerEvictionCoordinator coordinator;
+        private final TaskManagerEvictionCoordinator coordinator;
         private JobStatus status = JobStatus.RUNNING;
-        private ExecutionState executionState = ExecutionState.RUNNING;
-        private TaskManagerLocation location = oldLocation;
-        private boolean ready = true;
+        private boolean prepareReplacement = true;
+        private AllocationID runningAllocation;
+        private AllocationID replacementAllocation;
         private int restarts;
 
-        private Fixture() {
+        private Fixture() throws Exception {
+            this(false, true);
+        }
+
+        private Fixture(boolean activeCheckpoint, boolean retainedCheckpoint) throws Exception {
             configuration.set(
                     TaskManagerEvictionOptions.MAX_CHECKPOINT_WAIT, Duration.ofSeconds(10));
             configuration.set(
-                    JobManagerOptions.SCHEDULER_RESCALE_TRIGGER_ACTIVE_CHECKPOINT_ENABLED, false);
-            when(graph.getAllExecutionVertices()).thenReturn(Collections.singletonList(vertex));
-            when(graph.getCheckpointCoordinator()).thenReturn(checkpoints);
-            when(checkpoints.getCheckpointStore()).thenReturn(store);
-            when(checkpoints.getPendingCheckpoints()).thenReturn(Collections.emptyMap());
-            when(vertex.getExecutionState()).thenAnswer(ignored -> executionState);
-            when(vertex.getCurrentAssignedResourceLocation()).thenAnswer(ignored -> location);
-            when(pool.hasSufficientResourcesForTaskManagerEviction()).thenAnswer(ignored -> ready);
-            when(pool.markTaskManagersForEviction(anyCollection()))
-                    .thenAnswer(
-                            invocation -> {
-                                Set<ResourceID> added = new HashSet<>(invocation.getArgument(0));
-                                added.removeAll(marked);
-                                marked.addAll(added);
-                                return added;
-                            });
-            when(pool.isTaskManagerPendingEviction(any()))
-                    .thenAnswer(invocation -> marked.contains(invocation.getArgument(0)));
-            completed(1, 0);
-            recreateCoordinator();
-        }
-
-        private void recreateCoordinator() {
-            if (coordinator != null) {
-                coordinator.close();
+                    JobManagerOptions.SCHEDULER_RESCALE_TRIGGER_ACTIVE_CHECKPOINT_ENABLED,
+                    activeCheckpoint);
+            final JobVertex jobVertex = createNoOpVertex(1);
+            final JobGraph jobGraph = streamingJobGraph(jobVertex);
+            graph =
+                    TestingDefaultExecutionGraphBuilder.newBuilder()
+                            .setJobGraph(jobGraph)
+                            .build(graphExecutor);
+            graph.start(ComponentMainThreadExecutorServiceAdapter.forMainThread());
+            graph.transitionToRunning();
+            vertex = graph.getJobVertex(jobVertex.getID()).getTaskVertices()[0];
+            vertex.tryAssignResource(
+                    new TestingLogicalSlotBuilder()
+                            .setTaskManagerLocation(oldLocation)
+                            .createTestingLogicalSlot());
+            setVertexState(vertex, ExecutionState.RUNNING);
+            checkpoints =
+                    new CheckpointCoordinatorBuilder()
+                            .setClock(clock)
+                            .setTimer(checkpointExecutor)
+                            .setCheckpointIDCounter(checkpointIds)
+                            .setCompletedCheckpointStore(store)
+                            .setCheckpointsCleaner(cleaner)
+                            .setCheckpointStatsTracker(stats)
+                            .setCheckpointCoordinatorConfiguration(
+                                    CheckpointCoordinatorConfiguration.builder()
+                                            .setCheckpointInterval(60_000)
+                                            .setCheckpointTimeout(60_000)
+                                            .setMinPauseBetweenCheckpoints(
+                                                    activeCheckpoint ? 6_000 : 0)
+                                            .build())
+                            .build(graph);
+            if (retainedCheckpoint) {
+                completed(1, 0);
             }
+            pool.setResourceRequirements(ResourceCounter.withResource(ResourceProfile.UNKNOWN, 1));
+            runningAllocation = offer(oldLocation);
+            pool.reserveFreeSlot(runningAllocation, ResourceProfile.UNKNOWN);
             coordinator =
                     new TaskManagerEvictionCoordinator(
                             this,
@@ -310,9 +357,37 @@ class TaskManagerEvictionCoordinatorTest {
                             new UnregisteredMetricsGroup());
         }
 
+        private AllocationID offer(TaskManagerLocation location) {
+            final SlotOffer offer = new SlotOffer(new AllocationID(), 0, ResourceProfile.UNKNOWN);
+            assertThat(
+                            pool.offerSlots(
+                                    Collections.singleton(offer),
+                                    location,
+                                    gateway,
+                                    clock.relativeTimeMillis()))
+                    .containsExactly(offer);
+            return offer.getAllocationId();
+        }
+
         private void mark(ResourceID id) {
             coordinator.notifyTaskManagersPendingEviction(Collections.singleton(id));
+            updateReplacement();
             coordinator.reconcile();
+        }
+
+        private void setReady(boolean ready) {
+            prepareReplacement = ready;
+            if (!ready && replacementAllocation != null) {
+                pool.releaseSlot(replacementAllocation, new FlinkException("Replacement lost"));
+                replacementAllocation = null;
+            }
+            updateReplacement();
+        }
+
+        private void updateReplacement() {
+            if (prepareReplacement && !pool.hasSufficientResourcesForTaskManagerEviction()) {
+                replacementAllocation = offer(new LocalTaskManagerLocation());
+            }
         }
 
         private void advance(int seconds) {
@@ -320,14 +395,25 @@ class TaskManagerEvictionCoordinatorTest {
             coordinator.reconcile();
         }
 
-        private void completed(long id, long triggerTime) {
-            final CompletedCheckpoint checkpoint = mock(CompletedCheckpoint.class);
-            when(checkpoint.getCheckpointID()).thenReturn(id);
-            when(checkpoint.getTimestamp()).thenReturn(triggerTime);
-            when(store.getLatestCheckpoint()).thenReturn(checkpoint);
+        private void completed(long id, long triggerTime) throws Exception {
+            store.addCheckpointAndSubsumeOldestOne(
+                    new CompletedCheckpoint(
+                            graph.getJobID(),
+                            id,
+                            triggerTime,
+                            triggerTime,
+                            Collections.emptyMap(),
+                            Collections.emptyList(),
+                            CheckpointProperties.forCheckpoint(
+                                    CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION),
+                            new TestCompletedCheckpointStorageLocation(),
+                            null),
+                    cleaner,
+                    () -> {});
+            checkpointIds.setCount(id + 1);
         }
 
-        private void startRestart() {
+        private void startRestart() throws Exception {
             mark(oldLocation.getResourceID());
             advance(5);
             completed(2, clock.absoluteTimeMillis());
@@ -335,10 +421,22 @@ class TaskManagerEvictionCoordinatorTest {
             assertThat(restarts).isEqualTo(1);
         }
 
-        private void runningOn(TaskManagerLocation newLocation) {
+        private void runningOn(TaskManagerLocation newLocation) throws Exception {
+            setReady(false);
+            pool.releaseSlot(runningAllocation, new FlinkException("Previous execution cancelled"));
+            runningAllocation = offer(newLocation);
+            pool.reserveFreeSlot(runningAllocation, ResourceProfile.UNKNOWN);
+            setVertexState(vertex, ExecutionState.CANCELED);
+            vertex.resetForNewExecution();
+            assertThat(
+                            vertex.tryAssignResource(
+                                    new TestingLogicalSlotBuilder()
+                                            .setTaskManagerLocation(newLocation)
+                                            .createTestingLogicalSlot()))
+                    .isTrue();
+            setVertexState(vertex, ExecutionState.RUNNING);
             status = JobStatus.RUNNING;
-            executionState = ExecutionState.RUNNING;
-            location = newLocation;
+            prepareReplacement = true;
         }
 
         @Override
@@ -352,16 +450,29 @@ class TaskManagerEvictionCoordinatorTest {
         }
 
         @Override
+        public CheckpointCoordinator getCheckpointCoordinator() {
+            return checkpoints;
+        }
+
+        @Override
+        public long getFailedCheckpointCount() {
+            return stats.createSnapshot().getCounts().getNumberOfFailedCheckpoints();
+        }
+
+        @Override
         public boolean restart() {
             restarts++;
             status = JobStatus.RESTARTING;
-            executionState = ExecutionState.CANCELING;
+            setVertexState(vertex, ExecutionState.CANCELING);
             return true;
         }
 
         @Override
-        public void close() {
+        public void close() throws Exception {
             coordinator.close();
+            checkpoints.shutdown();
+            store.shutdown(JobStatus.FINISHED, cleaner);
+            graphExecutor.shutdownNow();
         }
     }
 }

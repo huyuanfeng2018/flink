@@ -19,7 +19,8 @@
 package org.apache.flink.runtime.resourcemanager;
 
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
-import org.apache.flink.runtime.jobmaster.JobMasterGateway;
+import org.apache.flink.runtime.jobmaster.utils.TestingJobMasterGateway;
+import org.apache.flink.runtime.jobmaster.utils.TestingJobMasterGatewayBuilder;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.util.concurrent.ManuallyTriggeredScheduledExecutor;
 
@@ -32,10 +33,6 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyCollection;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 class PendingTaskManagerEvictionsTest {
     @Test
@@ -44,15 +41,14 @@ class PendingTaskManagerEvictionsTest {
                 new ManuallyTriggeredScheduledExecutor();
         final List<Collection<ResourceID>> notifications = new ArrayList<>();
         final List<CompletableFuture<Acknowledge>> responses = new ArrayList<>();
-        final JobMasterGateway gateway = mock(JobMasterGateway.class);
-        when(gateway.notifyTaskManagersPendingEviction(any(), anyCollection(), any()))
-                .thenAnswer(
-                        invocation -> {
-                            notifications.add(new ArrayList<>(invocation.getArgument(1)));
-                            CompletableFuture<Acknowledge> response = new CompletableFuture<>();
-                            responses.add(response);
-                            return response;
-                        });
+        final TestingJobMasterGateway gateway = new TestingJobMasterGatewayBuilder().build();
+        gateway.setNotifyTaskManagersPendingEvictionFunction(
+                taskManagers -> {
+                    notifications.add(new ArrayList<>(taskManagers));
+                    CompletableFuture<Acknowledge> response = new CompletableFuture<>();
+                    responses.add(response);
+                    return response;
+                });
         final ResourceID first = ResourceID.generate();
         final ResourceID second = ResourceID.generate();
         try (PendingTaskManagerEvictions tracker =
@@ -89,17 +85,16 @@ class PendingTaskManagerEvictionsTest {
     void acknowledgesOnlyTheRevisionActuallySent() {
         final ManuallyTriggeredScheduledExecutor executor =
                 new ManuallyTriggeredScheduledExecutor();
-        final JobMasterGateway gateway = mock(JobMasterGateway.class);
+        final TestingJobMasterGateway gateway = new TestingJobMasterGatewayBuilder().build();
         final List<Collection<ResourceID>> notifications = new ArrayList<>();
         final CompletableFuture<Acknowledge> firstResponse = new CompletableFuture<>();
-        when(gateway.notifyTaskManagersPendingEviction(any(), anyCollection(), any()))
-                .thenAnswer(
-                        invocation -> {
-                            notifications.add(new ArrayList<>(invocation.getArgument(1)));
-                            return notifications.size() == 1
-                                    ? firstResponse
-                                    : CompletableFuture.completedFuture(Acknowledge.get());
-                        });
+        gateway.setNotifyTaskManagersPendingEvictionFunction(
+                taskManagers -> {
+                    notifications.add(new ArrayList<>(taskManagers));
+                    return notifications.size() == 1
+                            ? firstResponse
+                            : CompletableFuture.completedFuture(Acknowledge.get());
+                });
         try (PendingTaskManagerEvictions tracker =
                 new PendingTaskManagerEvictions(
                         ResourceManagerId.generate(), executor, Duration.ofSeconds(10))) {

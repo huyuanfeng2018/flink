@@ -25,9 +25,10 @@ import java.time.Duration;
 
 /** Options for cooperative TaskManager replacement without changing job parallelism. */
 @Internal
+@Documentation.ExcludeFromDocumentation(
+        "Fork-only prototype; documented in the cooperative TaskManager eviction guide.")
 public final class TaskManagerEvictionOptions {
 
-    @Documentation.Section(Documentation.Sections.EXPERT_SCHEDULING)
     public static final ConfigOption<Boolean> ENABLED =
             ConfigOptions.key("jobmanager.taskmanager-eviction.enabled")
                     .booleanType()
@@ -38,14 +39,12 @@ public final class TaskManagerEvictionOptions {
                                     + "flink/pending-eviction=true and must not delete it until Flink "
                                     + "releases it. Requires homogeneous TaskManagers and slots.");
 
-    @Documentation.Section(Documentation.Sections.EXPERT_SCHEDULING)
     public static final ConfigOption<Duration> QUIET_PERIOD =
             ConfigOptions.key("jobmanager.taskmanager-eviction.batch.quiet-period")
                     .durationType()
                     .defaultValue(Duration.ofSeconds(5))
                     .withDescription("Time without a new eviction intent before closing a batch.");
 
-    @Documentation.Section(Documentation.Sections.EXPERT_SCHEDULING)
     public static final ConfigOption<Duration> MAX_BATCH_WAIT =
             ConfigOptions.key("jobmanager.taskmanager-eviction.batch.max-wait")
                     .durationType()
@@ -55,7 +54,6 @@ public final class TaskManagerEvictionOptions {
                                     + "from the first intent. Does not override the requirement to "
                                     + "prepare sufficient healthy slots before interrupting tasks.");
 
-    @Documentation.Section(Documentation.Sections.EXPERT_SCHEDULING)
     public static final ConfigOption<Duration> MAX_CHECKPOINT_WAIT =
             ConfigOptions.key("jobmanager.taskmanager-eviction.checkpoint.max-wait")
                     .durationType()
