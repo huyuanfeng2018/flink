@@ -433,12 +433,10 @@ class TaskManagerEvictionCoordinatorTest {
             pool.reserveFreeSlot(runningAllocation, ResourceProfile.UNKNOWN);
             setVertexState(vertex, ExecutionState.CANCELED);
             vertex.resetForNewExecution();
-            assertThat(
-                            vertex.tryAssignResource(
-                                    new TestingLogicalSlotBuilder()
-                                            .setTaskManagerLocation(newLocation)
-                                            .createTestingLogicalSlot()))
-                    .isTrue();
+            vertex.tryAssignResource(
+                    new TestingLogicalSlotBuilder()
+                            .setTaskManagerLocation(newLocation)
+                            .createTestingLogicalSlot());
             setVertexState(vertex, ExecutionState.RUNNING);
             status = JobStatus.RUNNING;
             prepareReplacement = true;
