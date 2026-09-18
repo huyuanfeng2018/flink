@@ -144,7 +144,7 @@ public class DeclarativeSlotPoolBridge extends DeclarativeSlotPoolService implem
             return Optional.of(clazz.cast(this));
         }
 
-        return Optional.empty();
+        return super.castInto(clazz);
     }
 
     @Override
