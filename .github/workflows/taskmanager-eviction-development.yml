@@ -21,7 +21,7 @@ on:
     branches: ['codex/taskmanager-graceful-eviction']
     paths:
       - '.github/workflows/taskmanager-eviction-development.yml'
-      - 'tools/taskmanager-eviction.patch.b64'
+      - 'tools/taskmanager-eviction.patch.b64*'
 permissions:
   contents: write
 concurrency:
@@ -50,14 +50,15 @@ jobs:
       - name: Apply and format implementation
         if: hashFiles('tools/taskmanager-eviction.patch.b64') != ''
         run: |
-          base64 --decode tools/taskmanager-eviction.patch.b64 | gzip -d > /tmp/taskmanager-eviction.patch
+          cat tools/taskmanager-eviction.patch.b64* | base64 --decode | gzip -d > /tmp/taskmanager-eviction.patch
           echo 'a16a9f684eeb789628f544a4cdeaba90b50a81d418db320cdfd439f079486e97  /tmp/taskmanager-eviction.patch' | sha256sum --check
           git apply --check /tmp/taskmanager-eviction.patch
           git apply /tmp/taskmanager-eviction.patch
-          rm tools/taskmanager-eviction.patch.b64
+          rm tools/taskmanager-eviction.patch.b64*
           ./mvnw -B -pl flink-core,flink-runtime,flink-kubernetes spotless:apply
           git diff --check
-          git add flink-core flink-runtime flink-kubernetes docs tools/taskmanager-eviction.patch.b64
+          git add flink-core flink-runtime flink-kubernetes docs
+          git add -u tools
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m '[hotfix][runtime][kubernetes] Implement cooperative TaskManager eviction' -m 'Generated-by: GPT-6 Astra Pro'
           git push origin HEAD:codex/taskmanager-graceful-eviction
           echo 'EVICTION_IMPLEMENTATION_APPLIED=true' >> "$GITHUB_ENV"
