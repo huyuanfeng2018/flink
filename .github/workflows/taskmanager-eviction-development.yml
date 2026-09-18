@@ -51,7 +51,7 @@ jobs:
         if: hashFiles('tools/taskmanager-eviction.patch.b64') != ''
         run: |
           cat tools/taskmanager-eviction.patch.b64* | base64 --decode | gzip -d > /tmp/taskmanager-eviction.patch
-          echo 'a16a9f684eeb789628f544a4cdeaba90b50a81d418db320cdfd439f079486e97  /tmp/taskmanager-eviction.patch' | sha256sum --check
+          echo '29a08729d1b441f77c7b29aa6fa956a00d1a006be97b0d52dbd6d13710d445aa  /tmp/taskmanager-eviction.patch' | sha256sum --check
           git apply --check /tmp/taskmanager-eviction.patch
           git apply /tmp/taskmanager-eviction.patch
           rm tools/taskmanager-eviction.patch.b64*
@@ -59,7 +59,7 @@ jobs:
           git diff --check
           git add flink-core flink-runtime flink-kubernetes docs
           git add -u tools
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m '[hotfix][runtime][kubernetes] Implement cooperative TaskManager eviction' -m 'Generated-by: GPT-6 Astra Pro'
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m '[hotfix][runtime] Fix slot pool unwrapping and verify enabled eviction integration' -m 'Generated-by: GPT-6 Astra Pro'
           git push origin HEAD:codex/taskmanager-graceful-eviction
           echo 'EVICTION_IMPLEMENTATION_APPLIED=true' >> "$GITHUB_ENV"
           git archive --format=tar.gz HEAD > /tmp/flink-applied-source.tar.gz
@@ -72,7 +72,7 @@ jobs:
       - name: Validate runtime and Kubernetes integration
         if: env.EVICTION_IMPLEMENTATION_APPLIED == 'true'
         run: |
-          ./mvnw -B -T 2 -pl flink-kubernetes -am -Dcheckstyle.skip -Drat.skip=true -Dtest='*Eviction*,BlocklistDeclarativeSlotPoolTest,DefaultDeclarativeSlotPoolTest,DeclarativeSlotPoolBridgeTest,DefaultSchedulerTest,AdaptiveSchedulerTest,ExecutingTest,KubernetesPodTest,KubernetesResourceManagerDriverTest' -Dsurefire.failIfNoSpecifiedTests=false test
+          ./mvnw -B -T 2 -pl flink-kubernetes -am -Dcheckstyle.skip -Drat.skip=true -Dtest='*Eviction*,BlocklistDeclarativeSlotPoolTest,DefaultDeclarativeSlotPoolTest,DeclarativeSlotPoolBridgeTest,DefaultSchedulerTest,AdaptiveSchedulerTest,ExecutingTest,JobMasterTest,FineGrainedSlotManagerTest,ActiveResourceManagerTest,ResourceManagerTest,KubernetesPodTest,KubernetesResourceManagerDriverTest' -Dsurefire.failIfNoSpecifiedTests=false test
       - name: Publish test reports
         if: always() && env.EVICTION_IMPLEMENTATION_APPLIED == 'true'
         uses: actions/upload-artifact@v4
