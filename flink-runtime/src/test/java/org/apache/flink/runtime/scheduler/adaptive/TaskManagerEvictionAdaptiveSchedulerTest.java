@@ -143,12 +143,8 @@ class TaskManagerEvictionAdaptiveSchedulerTest extends AdaptiveSchedulerTestBase
             final List<TaskDeploymentDescriptor> initial = gateway.waitForSubmissions(2);
             runInMainThread(
                     () -> {
-                        initial.forEach(
-                                task ->
-                                        scheduler.updateTaskExecutionState(
-                                                new TaskExecutionState(
-                                                        task.getExecutionAttemptId(),
-                                                        ExecutionState.RUNNING)));
+                        initial.forEach(this::markRunning);
+                        assertThat(scheduler.getState()).isInstanceOf(Executing.class);
                         coordinator.notifyTaskManagersPendingEviction(
                                 Collections.singleton(first.getResourceID()));
                         assertThat(coordinator.isReadyToDeploy()).isFalse();
@@ -191,12 +187,7 @@ class TaskManagerEvictionAdaptiveSchedulerTest extends AdaptiveSchedulerTestBase
                                                         .isIn(
                                                                 replacement.getResourceID(),
                                                                 lateReplacement.getResourceID()));
-                        recovered.forEach(
-                                task ->
-                                        scheduler.updateTaskExecutionState(
-                                                new TaskExecutionState(
-                                                        task.getExecutionAttemptId(),
-                                                        ExecutionState.RUNNING)));
+                        recovered.forEach(this::markRunning);
                     });
             finished.get(10, TimeUnit.SECONDS);
             assertThat(supplyInMainThread(coordinator::isActive)).isFalse();
@@ -219,6 +210,18 @@ class TaskManagerEvictionAdaptiveSchedulerTest extends AdaptiveSchedulerTestBase
                         }
                     });
         }
+    }
+
+    private void markRunning(TaskDeploymentDescriptor task) {
+        final ExecutionAttemptID attempt = task.getExecutionAttemptId();
+        assertThat(
+                        scheduler.updateTaskExecutionState(
+                                new TaskExecutionState(attempt, ExecutionState.INITIALIZING)))
+                .isTrue();
+        assertThat(
+                        scheduler.updateTaskExecutionState(
+                                new TaskExecutionState(attempt, ExecutionState.RUNNING)))
+                .isTrue();
     }
 
     private void offer(

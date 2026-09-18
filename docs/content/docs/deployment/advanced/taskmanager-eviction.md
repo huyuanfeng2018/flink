@@ -123,6 +123,8 @@ another worker in the same cycle is still being handled.
 Focused validation commands (including upstream dependency modules) are:
 
 ```bash
+# Build the isolated RPC implementation and its loader before running RPC-based tests.
+./mvnw -B -pl flink-kubernetes -am -DskipTests install
 ./mvnw -B -pl flink-kubernetes -am \
   -Dtest='*Eviction*,KubernetesPodTest,KubernetesResourceManagerDriverTest,DefaultSchedulerTest,ExecutingTest' \
   -Dsurefire.failIfNoSpecifiedTests=false test
