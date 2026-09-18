@@ -1,0 +1,73 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Temporary development helper, restricted to this fork and feature branch.
+# Remove after the implementation has been applied and validated.
+name: TaskManager eviction development
+on:
+  push:
+    branches: ['codex/taskmanager-graceful-eviction']
+    paths:
+      - '.github/workflows/taskmanager-eviction-development.yml'
+      - 'tools/taskmanager-eviction.patch'
+permissions:
+  contents: write
+concurrency:
+  group: taskmanager-eviction-development
+  cancel-in-progress: false
+jobs:
+  develop:
+    if: github.repository == 'huyuanfeng2018/flink'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Export source for local inspection
+        run: git archive --format=tar.gz HEAD > /tmp/flink-source.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flink-eviction-source
+          path: /tmp/flink-source.tar.gz
+          retention-days: 3
+      - uses: actions/setup-java@v4
+        if: hashFiles('tools/taskmanager-eviction.patch') != ''
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Apply and format implementation
+        if: hashFiles('tools/taskmanager-eviction.patch') != ''
+        run: |
+          git apply --check tools/taskmanager-eviction.patch
+          git apply tools/taskmanager-eviction.patch
+          rm tools/taskmanager-eviction.patch
+          mvn -B -pl flink-core,flink-runtime,flink-kubernetes spotless:apply
+          git diff --check
+          git add flink-core flink-runtime flink-kubernetes docs tools/taskmanager-eviction.patch
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m '[runtime][kubernetes] Implement cooperative TaskManager eviction'
+          git push origin HEAD:codex/taskmanager-graceful-eviction
+          echo 'EVICTION_IMPLEMENTATION_APPLIED=true' >> "$GITHUB_ENV"
+      - name: Validate runtime and Kubernetes integration
+        if: env.EVICTION_IMPLEMENTATION_APPLIED == 'true'
+        run: |
+          mvn -B -T 2 -pl flink-kubernetes -am -Dcheckstyle.skip -Drat.skip=true -Dtest='*Eviction*,BlocklistDeclarativeSlotPoolTest,DefaultDeclarativeSlotPoolTest,DeclarativeSlotPoolBridgeTest,DefaultSchedulerTest,AdaptiveSchedulerTest,KubernetesResourceManagerDriverTest' -Dsurefire.failIfNoSpecifiedTests=false test
+      - name: Publish test reports
+        if: always() && env.EVICTION_IMPLEMENTATION_APPLIED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: flink-eviction-test-reports
+          path: |
+            flink-*/target/surefire-reports/
+          retention-days: 3
